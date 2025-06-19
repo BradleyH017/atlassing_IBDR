@@ -64,10 +64,10 @@ def main():
     
 
     # Test
-    # h5 = "results_round2/all_Mesenchymal/objects/adata_clusters_post_clusterQC.h5ad"
-    # celltypist_model = "results/combined/objects/leiden-adata_grouped_post_cluster_QC.pkl"
-    # compare_column = "leiden"
-    # outdir = "temp"
+    # h5 = "results/objects/from_irods/adata_PCAd_batched_umap_add_expression.h5ad"
+    # celltypist_model = "results/objects/from_irods/Label_1-adata_PCAd_batched_umap_add_expression.pkl"
+    # compare_column = "Label_1"
+    # outdir = "other_paper_figs"
 
     # Load the AnnData file.
     print('Loading AnnData')
@@ -131,6 +131,21 @@ def main():
 
     # Save the celltypist output
     ct_adata.write_h5ad(f"{outdir}/celltypist_prediction.h5ad")
+    
+    # Quantifying accuracy
+    # Calculate the proportion of correct predictions per annotation
+    ct_adata.obs['is_correct'] = ct_adata.obs['Label_1'] == ct_adata.obs['predicted_labels']
+    filtpred = ct_adata.obs[ct_adata.obs['conf_score'] > 0.5]
+    match_counts = filtpred.groupby('Label_1')['is_correct'].sum()
+    total_counts = filtpred['Label_1'].value_counts()
+    result = pd.DataFrame({
+        'total': total_counts,
+        'correct_matches': match_counts
+    })
+    filtpred['is_correct'].sum()/filtpred.shape[0] # 0.9706400367526062
+    result['accuracy'].median() # 0.9800539173117695
+    result['accuracy'] = result['correct_matches'] / result['total']
+
     
 
 # Execute 
