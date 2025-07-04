@@ -3,6 +3,18 @@
 This repo contains code and workflows to run the multi-round atlassing of the entire IBDverse single cell dataset.
 All executables and custom scripts are present within the `bin` directory
 
+### Installation
+
+If using Sanger farm. No downloads or installs are required. 
+Otherwise, singularity image can be downloaded from dockerhub:
+```
+export SINGULARITY_CACHEDIR=$PWD/.singularity_cache
+mkdir -p "$SINGULARITY_CACHEDIR"
+singularity pull docker://bh18/atlassing:33
+```
+- Then adjust the singularity paths in `workflows
+/*.smk` to the location of the downloaded image.
+
 # Replication
 To reproduce all analysis, simply download the input file (LINK TO COME), and execute each workflow in order. Details of which are provided below.
 
