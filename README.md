@@ -1,6 +1,6 @@
 # Dynamic, multi-tissue QC and clustering
 ### Author: Bradley Harris
-This repo contains code and workflows to run the multi-round atlassing of the entire IBDverse single cell dataset.
+This repo contains code and workflows to run the multi-round atlassing of the entire IBDverse single cell dataset --> https://www.medrxiv.org/content/10.1101/2025.06.24.25330216v1.
 All executables and custom scripts are present within the `bin` directory
 
 ### Installation
