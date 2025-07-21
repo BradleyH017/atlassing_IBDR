@@ -7,6 +7,13 @@ import anndata as ad
 import scanpy as sc
 import math
 
+# options
+min_cells = 5
+min_donors = 30
+min_prop_expr = 0.2
+method = "Sum"
+want_meta = "sex,age"
+
 ###############
 # Load data
 ###############
@@ -15,30 +22,35 @@ adata.X = adata.layers['counts']
 
 # Extract the samples x celltypes use to use
 cell_counts = adata.obs.groupby(['predicted_labels', 'Genotyping_ID']).size().reset_index(name='n_cells')
-valid_pairs = cell_counts[cell_counts['n_cells'] >= 5]
+valid_pairs = cell_counts[cell_counts['n_cells'] >= min_cells]
 valid_group_counts = valid_pairs['predicted_labels'].value_counts()
-valid_groups = valid_group_counts[valid_group_counts >= 30].index
+valid_groups = valid_group_counts[valid_group_counts >= min_donors].index
 valid_pairs = valid_pairs[valid_pairs['predicted_labels'].isin(valid_groups)]
 valid_combo_set = set(zip(valid_pairs['Genotyping_ID'], valid_pairs['predicted_labels']))
 
 ###############
 # Pseudobulk
 ###############
-adata.X = adata.layers['log1p_cp10k']
+if method == "Mean":
+    adata.X = adata.layers['log1p_cp10k']
+
 for label in valid_groups:
     print(f"Processing cell type: {label}")
     # Individuals with enough cells in this label
     individuals = valid_pairs[valid_pairs['predicted_labels'] == label]['Genotyping_ID']
     profiles = []
     indiv_index = []
-    min_samps = math.ceil(len(individuals)*0.2)
+    min_samps = math.ceil(len(individuals)*min_prop_expr)
     for indiv in individuals:
         # Get expression matrix for this celltype and indivudla
         cell_indices=adata.obs[(adata.obs['Genotyping_ID'].astype(str) == indiv) & (adata.obs['predicted_labels'].astype(str) == label)].index
         X = adata[cell_indices].X
         X_dense = X.toarray() if hasattr(X, 'toarray') else X
-        mean_expr = X_dense.mean(axis=0)
-        profiles.append(mean_expr)
+        if method == "Mean":
+            want_expr = X_dense.mean(axis=0)
+        else:
+            want_expr = X_dense.sum(axis=0)
+        profiles.append(want_expr)
         indiv_index.append(indiv)    
     #Aggregate
     pseudobulk_df = pd.DataFrame(
@@ -49,7 +61,13 @@ for label in valid_groups:
     # Subset for gene expressed in >20% samples
     pseudobulk_df = pseudobulk_df.loc[:, (pseudobulk_df > 0).sum(axis=0) >= min_samps]
     # Save
-    pseudobulk_df.to_csv(f"/lustre/scratch127/humgen/projects_v2/sc-eqtl-ibd/analysis/jingling_analysis/IBDverse_data/pseudobulk/{label}.tsv.gz", sep="\t", index=True, compression="gzip")
+    pseudobulk_df.to_csv(f"/lustre/scratch127/humgen/projects_v2/sc-eqtl-ibd/analysis/jingling_analysis/IBDverse_data/pseudobulk/d{method}__{label}.tsv.gz", sep="\t", index=True, compression="gzip")
+
+# Save metadata
+meta_list = want_meta.split(",") 
+meta_list.append("Genotyping_ID")  
+to_save = adata.obs[meta_list].drop_duplicates().reset_index(drop=True).set_index("Genotyping_ID")
+to_save.to_csv(f"/lustre/scratch127/humgen/projects_v2/sc-eqtl-ibd/analysis/jingling_analysis/IBDverse_data/pseudobulk/metadata_for_DE.tsv.gz", sep="\t", index=True, compression="gzip")
 
 
 ##################
