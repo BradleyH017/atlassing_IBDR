@@ -1,6 +1,8 @@
 # Define which round of the analysis this is - will alter config and original input file
 configfile: "configs/config.yaml" # round1
-input0 = expand("input_v7/adata_raw_input_{tissue}.h5ad", tissue=config["tissue"])
+input0 = expand("input_temp/ibdverse_{tissue}.h5ad", tissue=config["tissue"])
+envvars:
+    "SINGULARITYENV_LD_LIBRARY_PATH"
 
 rule all:
     input:
@@ -50,15 +52,11 @@ rule qc_raw:
         pref_matrix=config["pref_matrix"],
         calc_hvgs_together=config["calc_hvgs_together"]
     resources:
-        mem=1500000, # all = 850000
-        queue='teramem', # all = teramem
-        mem_mb=1500000,
-        mem_mib=1500000,
-        disk_mb=1500000,
-        tmpdir="tmp",
-        threads=8 # all = 8
-    conda:
-        "scvi-env"
+        queue='normal',
+        mem_mb=50000,
+        disk_mb=50000
+    singularity:
+        "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
         r"""
         mkdir -p results/{wildcards.tissue}/objects/per_samp
@@ -106,22 +104,19 @@ if "scVI" in batch_methods:
             "results/{tissue}/objects/adata_PCAd.h5ad"
         output:
             "results/{tissue}/tables/batch_correction/scVI_matrix.npz"
-        conda:
-            "scvi-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         params:
             batch_column=config["batch_column"],
-            correct_variable_only=config["correct_variable_only"]
+            correct_variable_only=config["correct_variable_only"],
         resources:
-            mem=250000, # All = 300000
-            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # All = gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"
-            mem_mb=250000,
-            mem_mib=250000,
-            disk_mb=250000,
-            tmpdir="tmp",
-            threads=8 # all = 8
+            queue='gpu-normal -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # Should be gpu-huge
+            mem_mb=15000, # 250000
+            disk_mb=15000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
+            python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('CUDA version:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
 
             python bin/001b-batch_correction.py \
                 --tissue {wildcards.tissue} \
@@ -138,22 +133,20 @@ if "scVI_default" in batch_methods:
             "results/{tissue}/objects/adata_PCAd.h5ad"
         output:
             "results/{tissue}/tables/batch_correction/scVI_default_matrix.npz"
-        conda:
-            "scvi-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         params:
             batch_column=config["batch_column"],
             correct_variable_only=config["correct_variable_only"]
         resources:
-            mem=480000, # All = 300000
-            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # All = gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"
-            mem_mb=480000,
-            mem_mib=480000,
-            disk_mb=480000,
-            tmpdir="tmp",
-            threads=8 # all = 8
+            queue='gpu-normal -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # Should be gpu-huge
+            mem_mb=15000, # 480000
+            disk_mb=15000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
+            export SINGULARITYENV_LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/software/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spac/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/cuda-11.8.0-vw5pdvpi33mowuxd7w3zgmrbfejiqxqb/targets/x86_64-linux/lib
+
 
             python bin/001b-batch_correction.py \
                 --tissue {wildcards.tissue} \
@@ -170,19 +163,15 @@ if "Harmony" in batch_methods:
             "results/{tissue}/objects/adata_PCAd.h5ad"
         output:
             "results/{tissue}/tables/batch_correction/Harmony_matrix.npz"
-        conda:
-            "scvi-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         params:
             batch_column=config["batch_column"],
             correct_variable_only=config["correct_variable_only"]
         resources:
-            mem=300000, # All = 300000
-            queue='long', # All = long
-            mem_mb=300000,
-            mem_mib=300000,
-            disk_mb=300000,
-            tmpdir="tmp",
-            threads=8 # all = 8
+            queue='long',
+            mem_mb=15000, # 300000
+            disk_mb=15000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
@@ -205,19 +194,16 @@ if "scANVI" in batch_methods:
             scANVI_col=config["scANVI_annot_column"],
             batch_column=config["batch_column"],
             correct_variable_only=config["correct_variable_only"]
-        conda:
-            "scvi-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         resources:
-            mem=300000, # All = 300000
-            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # All = gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"
-            mem_mb=300000,
-            mem_mib=300000,
-            disk_mb=300000,
-            tmpdir="tmp",
-            threads=8 # all = 8
+            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"',
+            mem_mb=15000, # 300000
+            disk_mb=15000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
+            export SINGULARITYENV_LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/software/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spac/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/cuda-11.8.0-vw5pdvpi33mowuxd7w3zgmrbfejiqxqb/targets/x86_64-linux/lib
 
             python bin/001b-batch_correction.py \
                 --tissue {wildcards.tissue} \
@@ -250,16 +236,12 @@ if config["benchmark_batch_correction"]:
             label_integration=config["scANVI_annot_column"],
             batch_column=config["batch_column"],
             var_explained_cols=config["var_explained_cols"]
-        conda:
-            "scib-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         resources:
-            mem=450000, # All = 350000
-            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # All = gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"
-            mem_mb=450000,
-            mem_mib=450000,
-            disk_mb=450000,
-            tmpdir="tmp",
-            threads=8 # all = 8
+            queue='gpu-huge -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # 
+            mem_mb=15000, # 450000
+            disk_mb=15000
         shell:
             r"""
             methods_combined="$(echo "{params.methods}" | sed 's/ /,/g')"
@@ -288,16 +270,12 @@ else:
             "results/{tissue}/objects/adata_PCAd_batched.h5ad"
         params:
             method=config["pref_matrix"]
-        conda:
-            "scvi-env_reserve"
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         resources:
-            mem=150000, # All =300000
-            queue='normal',
-            mem_mb=150000,
-            mem_mib=150000,
-            disk_mb=150000,
-            tmpdir="tmp",
-            threads=2
+            queue='normal', # 
+            mem_mb=15000, # 150000
+            disk_mb=15000
         shell:
             r"""
             echo X_{params.method} >> {output[0]}
@@ -318,15 +296,11 @@ if config["use_bbknn"]:
         params:
             use_matrix="X_pca"
         resources:
-            mem=increment_memory(750000),
-            queue='teramem',
-            mem_mb=increment_memory(750000),
-            mem_mib=increment_memory(750000),
-            disk_mb=increment_memory(750000),
-            tmpdir="tmp",
-            threads=16
-        conda:
-            "bbknn"
+            queue='normal', # Should be teramem
+            mem_mb=15000, # 750000
+            disk_mb=15000
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         shell:
             r"""
             python bin/002-bbknn.py \
@@ -343,15 +317,11 @@ if "Manual" in config["nn_choice"]:
         params:
             nn=config["nn"]
         resources:
-            mem=5000,
             queue='normal',
-            mem_mb=5000,
-            mem_mib=5000,
-            disk_mb=5000,
-            tmpdir="tmp",
-            threads=1
-        conda:
-            "scvi-env_reserve"
+            mem_mb=500, 
+            disk_mb=500
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         shell:
             r"""
             echo {params.nn} > {output}
@@ -368,16 +338,12 @@ if "array" in config["nn_choice"]:
             "results/{tissue}/tables/nn_array/adata_PCAd_batched_{nn_value}.h5ad"
         params:
             batch_column=config["batch_column"]
-        conda:
-            "scib-env"
         resources:
-            mem=increment_memory(850000), # All = 350000
-            queue='teramem', # All = long
-            mem_mb=increment_memory(850000),
-            mem_mib=increment_memory(850000),
-            disk_mb=increment_memory(850000), 
-            tmpdir="tmp",
-            threads=32 # All =32
+            queue='normal',
+            mem_mb=15000, # 850000
+            disk_mb=15000
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/nn_array
@@ -404,13 +370,9 @@ if "array" in config["nn_choice"]:
             "results/{tissue}/tables/nn_array/summary_nn_array.txt",
             "results/{tissue}/tables/optimum_nn.txt"
         resources:
-            mem=increment_memory(20000),
-            queue='long',
-            mem_mb=increment_memory(20000),
-            mem_mib=increment_memory(20000),
-            disk_mb=increment_memory(20000), 
-            tmpdir="tmp",
-            threads=2 
+            queue='normal',
+            mem_mb=15000, # 850000
+            disk_mb=15000
         shell:
             r"""
             cat {input} >> {output[0]}
@@ -432,15 +394,11 @@ rule get_umap:
     params:
         col_by=config["col_by"]
     resources:
-        mem=increment_memory(200000), # All = 350000
-        queue='normal', # All = long
-        mem_mb=increment_memory(200000),
-        mem_mib=increment_memory(200000),
-        disk_mb=increment_memory(200000), 
-        tmpdir="tmp",
-        threads=32 # All =32
-    conda:
-        "scvi-env_reserve"
+        queue='normal',
+        mem_mb=20000, # 200000
+        disk_mb=20000
+    singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
         r"""
         python bin/003-umap_embedding.py \
@@ -462,15 +420,11 @@ rule cluster_array:
         "results/{tissue}/tables/clustering_array/leiden_{clustering_resolution}/clusters.csv",
         "results/{tissue}/tables/clustering_array/leiden_{clustering_resolution}/umap_clusters_res{clustering_resolution}.png"
     resources:
-        mem=increment_memory(150000), #All - 350000
-        queue='normal', # All = long
-        mem_mb=increment_memory(150000),
-        mem_mib=increment_memory(150000),
-        disk_mb=increment_memory(150000),
-        tmpdir="tmp",
-        threads=16 # All 16
-    conda:
-        "single_cell"
+        queue='normal',
+        mem_mb=20000, # 150000
+        disk_mb=20000
+    singularity:
+        "/software/hgi/softpack/installs/users/eh19//test-single-cell/20-scripts/singularity.sif"
     shell:
         r"""
         mkdir -p results/{wildcards.tissue}/tables/clustering_array
@@ -484,9 +438,6 @@ rule cluster_array:
 
 
 if config["optimise_run_params"]:
-    def get_mem_mb(wildcards, attempt):
-        return attempt * 1000000 # All 750000
-
     rule run_params_optimisation:
         input:
             "results/{tissue}/tables/clustering_array/leiden_3.0/clusters.csv",
@@ -498,15 +449,11 @@ if config["optimise_run_params"]:
         params:
             optimise_res=config["keras_optimisation_res"]
         resources:
-            mem=get_mem_mb,
-            queue='teramem', # All = normal
-            mem_mb=get_mem_mb,
-            mem_mib=get_mem_mb,
-            disk_mb=get_mem_mb,
-            tmpdir="tmp",
-            threads=20 # Aids parallelisation. For all , use 20 threads and 750000 memory 
-        conda:
-            "single_cell"
+            queue='normal',
+            mem_mb=20000, # 1000000
+            disk_mb=20000
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-single-cell/20-scripts/singularity.sif"
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/keras-grid_search
@@ -528,15 +475,11 @@ else:
         output:
             "results/{tissue}/tables/keras-grid_search/keras-use_params.txt"
         resources:
-            mem=1000,
             queue='normal',
             mem_mb=1000,
-            mem_mib=1000,
-            disk_mb=1000,
-            tmpdir="tmp",
-            threads=1
-        conda:
-            "scvi-env_reserve"
+            disk_mb=1000
+        singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         params:
             activation=config["activation"],
             loss=config["loss"],
@@ -567,15 +510,11 @@ rule test_clusters_keras:
     output:
         "results/{tissue}/tables/clustering_array/leiden_{clustering_resolution}/base-model_report.tsv.gz"
     resources:
-        mem=increment_memory(1400000), #All - 850000
-        queue='teramem',
-        mem_mb=increment_memory(1400000),
-        mem_mib=increment_memory(1400000),
-        disk_mb=increment_memory(1400000),
-        tmpdir="tmp",
-        threads=16 # All 16
-    conda:
-        "single_cell"
+        queue='normal', # teramem
+        mem_mb=10000, # 1400000
+        disk_mb=10000
+    singularity:
+        "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
         r"""
         mkdir -p results/{wildcards.tissue}/tables/clustering_array
@@ -612,15 +551,11 @@ rule summarise_cluster_test:
     params:
         MCC_thresh=config["MCC_thresh"]
     resources:
-        mem=850000, # All - 350000
-        queue='teramem', # All - normal
-        mem_mb=850000,
-        mem_mib=850000,
-        disk_mb=850000,
-        tmpdir="tmp",
-        threads=1
-    conda:
-        "scvi-env_reserve"
+        queue='normal', # teramem
+        mem_mb=10000, # 850000
+        disk_mb=10000
+    singularity:
+            "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
         r"""
         mkdir -p results/{wildcards.tissue}/figures/clustering_array_summary
