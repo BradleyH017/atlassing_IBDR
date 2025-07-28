@@ -77,6 +77,22 @@ def parse_options():
             required=True,
             help=''
         )
+
+    parser.add_argument(
+            '-tissue_col', '--tissue_col',
+            action='store',
+            dest='tissue_col',
+            required=True,
+            help=''
+        )
+    
+    parser.add_argument(
+            '-label_group_col', '--label_group_col',
+            action='store',
+            dest='label_group_col',
+            required=True,
+            help=''
+        )
     
     parser.add_argument(
             '-d', '--discard_other_inflams',
@@ -383,7 +399,11 @@ def main():
     
     # Finally, derive and print the tissue arguments
     tissue=inherited_options.tissue
+    tissue_col=inherited_options.tissue_col
+    label_group_col=inherited_options.label_group_col
     print(f"~~~~~~~ TISSUE:{tissue}")
+    print(f"~~~~~~~ TISSUE_col:{tissue_col}")
+    print(f"~~~~~~~ GROUP_col:{label_group_col}")
     
     # Do we have a GPU?
     use_gpu = torch.cuda.is_available()
@@ -429,9 +449,9 @@ def main():
     #    adata.X = adata.layers['counts'].copy() # Takes lots of memory, .X is already counts
 
     print(f"Initial shape of the data is:{adata.shape}")
-    tissues = np.unique(adata.obs['tissue'])
+    tissues = np.unique(adata.obs[tissue_col])
     #for t in tissues:
-    #    tempt = adata.obs[adata.obs['tissue'] == t]
+    #    tempt = adata.obs[adata.obs[tissue_col] == t]
     #    print(f"For {t}, there is {len(np.unique(tempt['sanger_sample_id']))} samples. A total of {tempt.shape[0]} cells")
     #    cd = tempt[tempt['disease_status'] == "CD"]
     #    print(f"{len(np.unique(cd['sanger_sample_id']))} are CD")
@@ -463,7 +483,7 @@ def main():
     adata.obs['log_total_counts'] = np.log10(adata.obs['total_counts'])
     
     # Remove samples with fewer than X cells. Important if doing relative QC
-    adata.obs['samp_tissue'] = adata.obs['sanger_sample_id'].astype('str') + "_" + adata.obs['tissue'].astype('str')
+    adata.obs['samp_tissue'] = adata.obs['sanger_sample_id'].astype('str') + "_" + adata.obs[tissue_col].astype('str')
     samp_data = np.unique(adata.obs.samp_tissue, return_counts=True)
     cells_sample = pd.DataFrame({'sample': samp_data[0], 'Ncells':samp_data[1]})
     chuck = cells_sample.loc[cells_sample['Ncells'] < min_ncells_per_sample, 'sample'].values
@@ -472,13 +492,13 @@ def main():
         
     # If running on epithelial, remove samples from the blood
     if tissue == "all_Epithelial":
-        adata = adata[adata.obs['tissue'] != "blood"]
+        adata = adata[adata.obs[tissue_col] != "blood"]
     
     # Plot prelimeinary exploratory plots
     # These are per-grouping for each parameter - to highlight where shared/common QC could be useful
     # Also force this to be done per tissue
     for index, c in enumerate(cols):
-        nmad_qc.dist_plot(adata, c, within="tissue", relative_threshold=relative_nMAD_threshold, absolute=thresholds[c], out=qc_path)
+        nmad_qc.dist_plot(adata, c, within=tissue_col, relative_threshold=relative_nMAD_threshold, absolute=thresholds[c], out=qc_path)
         nmad_qc.dist_plot(adata, c, within=relative_grouping, relative_threshold=relative_nMAD_threshold, absolute=thresholds[c], out=qc_path)
     
     # Now calculate the QC metrics, apply absolute/relative thresholds with the desired method, and save plots of where the thresholds lie based on this grouping
@@ -512,7 +532,7 @@ def main():
     for t in tissues:
         plt.figure(figsize=(8, 6))
         fig,ax = plt.subplots(figsize=(8,6))
-        sns.distplot(cells_sample[cells_sample['sample'].isin(adata.obs[adata.obs['tissue'] == t]['samp_tissue'])].Ncells)
+        sns.distplot(cells_sample[cells_sample['sample'].isin(adata.obs[adata.obs[tissue_col] == t]['samp_tissue'])].Ncells)
         plt.xlabel('Cells/sample')
         plt.axvline(x = 500, color = 'red', linestyle = '--', alpha = 0.5)
         ax.set(xlim=(0, max(cells_sample.Ncells)))
@@ -543,14 +563,14 @@ def main():
 
     # Plot the distribution per tissue
     cols_to_plot = ["nCells", "Median_nCounts", "Median_nGene_by_counts", "Median_MT"]
-    adata.obs['disease_tissue'] = adata.obs['tissue'].astype(str) + "_" + adata.obs['disease_status'].astype(str)
+    adata.obs['disease_tissue'] = adata.obs[tissue_col].astype(str) + "_" + adata.obs['disease_status'].astype(str)
     td = np.unique(adata.obs['disease_tissue'])
     if plot_per_samp_qc == "yes":
         for c in cols_to_plot:
             print(c)
             plt.figure(figsize=(8, 6))
             for t in tissues:
-                samps = np.unique(adata.obs.loc[adata.obs['tissue'] == t,"samp_tissue"].values)
+                samps = np.unique(adata.obs.loc[adata.obs[tissue_col] == t,"samp_tissue"].values)
                 data = depth_count[depth_count.index.isin(samps)][c]
                 sns.distplot(data, hist=False, rug=True, label=t)
             
@@ -576,7 +596,7 @@ def main():
         
         # Within tissue for median
         for t in tissues:
-            samps = np.unique(adata.obs.loc[adata.obs['tissue'] == t, 'samp_tissue'].values)
+            samps = np.unique(adata.obs.loc[adata.obs[tissue_col] == t, 'samp_tissue'].values)
             plt.figure(figsize=(8, 6))
             plt.scatter(depth_count[depth_count.index.isin(samps)]["Median_nCounts"], depth_count[depth_count.index.isin(samps)]["Median_nGene_by_counts"],  c=depth_count[depth_count.index.isin(samps)]["High_cell_sample"], alpha=0.7)
             plt.xlabel('Median counts / cell')
@@ -749,10 +769,10 @@ def main():
             exclude = temp[temp['Median_nGene_by_counts'] < min_median_nGene_per_samp_gut].index.values
         
         if plot_per_samp_qc == "yes":
-            proportion_df = adata.obs.groupby(['samp_tissue', 'category__machine']).size().reset_index(name='count')
+            proportion_df = adata.obs.groupby(['samp_tissue', label_group_col]).size().reset_index(name='count')
             proportion_df = proportion_df[proportion_df['samp_tissue'].isin(temp.index.values)]
             proportion_df['proportion'] = proportion_df.groupby('samp_tissue')['count'].transform(lambda x: x / x.sum())
-            pivot_df = proportion_df.pivot(index='samp_tissue', columns='category__machine', values='proportion').fillna(0)
+            pivot_df = proportion_df.pivot(index='samp_tissue', columns=label_group_col, values='proportion').fillna(0)
             colors = sns.color_palette("husl", len(pivot_df.columns))
             fig, ax = plt.subplots(figsize=(10, 6))
             excluded_df = pivot_df.loc[exclude]
@@ -767,7 +787,7 @@ def main():
                 ax.bar(combined_df.index, combined_df[category], bottom=bottom, color=colors[idx], label=category)
                 bottom += combined_df[category].fillna(0).values
             #
-            ax.legend(title='Category__Machine', bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax.legend(title=label_group_col, bbox_to_anchor=(1.05, 1), loc='upper left')
             ax.set_title('Relative Proportions of Category__Machine by Samp_Tissue')
             ax.set_xlabel('Samp_Tissue')
             ax.set_ylabel('Proportion')
@@ -799,10 +819,10 @@ def main():
     if use_abs_per_samp == "yes":
         # Min median nGene
         blood_keep = (depth_count['Median_nCounts'] > min_median_nCount_per_samp_blood) & (depth_count['Median_nGene_by_counts'] > min_median_nGene_per_samp_blood)
-        blood_keep = blood_keep & depth_count.index.isin(adata.obs[adata.obs['tissue'] == "blood"]['samp_tissue'])
+        blood_keep = blood_keep & depth_count.index.isin(adata.obs[adata.obs[tissue_col] == "blood"]['samp_tissue'])
         blood_keep = blood_keep[blood_keep == True].index
         gut_keep = (depth_count['Median_nCounts'] > min_median_nCount_per_samp_gut) & (depth_count['Median_nGene_by_counts'] > min_median_nGene_per_samp_gut)
-        gut_keep = gut_keep & depth_count.index.isin(adata.obs[adata.obs['tissue'] != "blood"]['samp_tissue'])
+        gut_keep = gut_keep & depth_count.index.isin(adata.obs[adata.obs[tissue_col] != "blood"]['samp_tissue'])
         gut_keep = gut_keep[gut_keep == True].index
         both_keep = list(np.concatenate([blood_keep, gut_keep]))
         if "samples_keep" not in depth_count.columns:
@@ -830,7 +850,7 @@ def main():
     columns_to_convert = [col for col in adata.obs.columns if col in depth_count.columns and col != 'High_cell_sample' and col != "samp_tissue" and col != "samples_keep" and col != "disease_tissue"]
     print(f"converting: {columns_to_convert}")
     adata.obs[columns_to_convert] = adata.obs[columns_to_convert].astype(float)
-    adata.obs.set_index("cell", inplace=True)
+    adata.obs.set_index(adata.obs.columns[0], inplace=True)
     
     # Plot sankey
     #temp = adata.obs[["log_total_counts_keep", "log_n_genes_by_counts_keep", "pct_counts_gene_group__mito_transcript_keep", "samples_keep"]]
@@ -933,7 +953,7 @@ def main():
     # Print the final shape of the high QC data
     print(f"The final shape of the high QC data is: {adata.shape}")
     for t in tissues:
-     tempt = adata.obs[adata.obs['tissue'] == t]
+     tempt = adata.obs[adata.obs[tissue_col] == t]
      print(f"For {t}, there is {len(np.unique(tempt['sanger_sample_id']))} samples. A total of {tempt.shape[0]} cells")
      cd = tempt[tempt['disease_status'] == "CD"]
      print(f"{len(np.unique(cd['sanger_sample_id']))} are CD")
@@ -952,7 +972,7 @@ def main():
         sc.tl.pca(adata, svd_solver='arpack')
 
         # Plot PCA
-        sc.pl.pca(adata, color="tissue", save="_tissue.png")
+        sc.pl.pca(adata, color=tissue_col, save="_tissue.png")
         #sc.pl.pca(adata, color="category__machine", save="_category.png")
         #sc.pl.pca(adata, color="input", save="_input.png")
         sc.pl.pca(adata, color=relative_grouping, save=f"_{relative_grouping}.png")
