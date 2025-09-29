@@ -72,12 +72,14 @@ def main():
     print(f"pref_matrix: {pref_matrix}")
 
     # Load the data
+    print("..Loading anndata")
     adata = sc.read_h5ad(fpath)    
     
     # Redefine the NN matrix (from the one derived from the desired latent variables)
     pref_matrix_nn = pref_matrix + "_nn"
     
     # Cluster using optimum NN and the given resolution
+    print("..Clustering")
     sc.tl.leiden(adata, resolution=clustering_resolution, neighbors_key=pref_matrix_nn)
     
     # Save adata

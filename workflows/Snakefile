@@ -1,6 +1,6 @@
 # Define which round of the analysis this is - will alter config and original input file
 configfile: "configs/config.yaml" # round1
-input0 = expand("input_temp/ti-Full_cohort-{tissue}.h5ad", tissue=config["tissue"])
+input0 = expand("input_temp/adata_raw_input_{tissue}.h5ad", tissue=config["tissue"])
 envvars:
     "SINGULARITYENV_LD_LIBRARY_PATH"
 
@@ -25,6 +25,7 @@ rule qc_raw:
         tissue_col=config["tissue_col"],
         label_group_col=config["label_group_col"],
         discard_other_inflams=config["discard_other_inflams"], 
+        sample_col=config["sample_col"],
         all_blood_immune=config["all_blood_immune"],
         min_nUMI=config["min_nUMI"],
         relative_grouping=config["relative_grouping"],
@@ -52,11 +53,12 @@ rule qc_raw:
         sample_level_grouping=config["sample_level_grouping"],
         cols_sample_relative_filter=config["cols_sample_relative_filter"],
         pref_matrix=config["pref_matrix"],
-        calc_hvgs_together=config["calc_hvgs_together"]
+        calc_hvgs_together=config["calc_hvgs_together"],
+        min_cells_per_gene=config["min_cells_per_gene"]
     resources:
         queue='normal',
-        mem_mb=250000,
-        disk_mb=250000
+        mem_mb=50000,
+        disk_mb=50000
     singularity:
         "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
@@ -67,6 +69,7 @@ rule qc_raw:
         --input_file {input} \
         --tissue {wildcards.tissue} \
         --tissue_col {params.tissue_col} \
+        --sample_col {params.sample_col} \
         --label_group_col {params.label_group_col} \
         --discard_other_inflams {params.discard_other_inflams} \
         --all_blood_immune {params.all_blood_immune} \
@@ -96,7 +99,8 @@ rule qc_raw:
         --sample_level_grouping {params.sample_level_grouping} \
         --cols_sample_relative_filter {params.cols_sample_relative_filter} \
         --pref_matrix {params.pref_matrix} \
-        --calc_hvgs_together {params.calc_hvgs_together}
+        --calc_hvgs_together {params.calc_hvgs_together} \
+        --min_cells_per_gene {params.min_cells_per_gene}
         """
 
 # Get the batch methods to use
@@ -115,8 +119,8 @@ if "scVI" in batch_methods:
             correct_variable_only=config["correct_variable_only"],
         resources:
             queue='gpu-normal -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # Should be gpu-huge
-            mem_mb=50000, # 250000
-            disk_mb=50000
+            mem_mb=15000, # 250000
+            disk_mb=15000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
@@ -399,8 +403,8 @@ rule get_umap:
         col_by=config["col_by"]
     resources:
         queue='normal',
-        mem_mb=200000, # 200000
-        disk_mb=200000
+        mem_mb=20000, # 200000
+        disk_mb=20000
     singularity:
             "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
@@ -428,7 +432,7 @@ rule cluster_array:
         mem_mb=20000, # 150000
         disk_mb=20000
     singularity:
-        "/software/hgi/softpack/installs/users/eh19//test-single-cell/20-scripts/singularity.sif"
+        "/software/hgi/softpack/installs/users/bh18//pascient/2-scripts/singularity.sif"
     shell:
         r"""
         mkdir -p results/{wildcards.tissue}/tables/clustering_array
