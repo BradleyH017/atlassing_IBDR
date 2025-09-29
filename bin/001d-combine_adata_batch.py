@@ -11,8 +11,8 @@ print(cwd)
 
 # Load packages
 import sys
-sys.path.append('/software/team152/bh18/pip')
-sys.path.append('/usr/local/')
+#sys.path.append('/software/team152/bh18/pip')
+#sys.path.append('/usr/local/')
 print("System path")
 print(sys.path)
 import numpy as np
