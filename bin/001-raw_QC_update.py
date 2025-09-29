@@ -11,8 +11,8 @@ print(cwd)
 
 # Load packages
 import sys
-sys.path.append('/software/team152/bh18/pip')
-sys.path.append('/usr/local/')
+#sys.path.append('/software/team152/bh18/pip')
+#sys.path.append('/usr/local/')
 print("System path")
 print(sys.path)
 import numpy as np
@@ -106,6 +106,14 @@ def parse_options():
             '-abi', '--all_blood_immune',
             action='store',
             dest='all_blood_immune',
+            required=True,
+            help=''
+        )
+
+    parser.add_argument(
+            '-sc', '--sample_col',
+            action='store',
+            dest='sample_col',
             required=True,
             help=''
         )
@@ -326,6 +334,14 @@ def parse_options():
         required=False,
         help=''
     )
+    
+    parser.add_argument(
+        '-mcpg', '--min_cells_per_gene',
+        action='store',
+        dest='min_cells_per_gene',
+        required=False,
+        help=''
+    )
 
     return parser.parse_args()
 
@@ -365,6 +381,7 @@ def main():
     cols_sample_relative_filter = cols_sample_relative_filter.split(",")
     pref_matrix = inherited_options.pref_matrix
     calc_hvgs_together = inherited_options.calc_hvgs_together
+    min_cells_per_gene = float(inherited_options.min_cells_per_gene)
     
     print("~~~~~~~~~ Running arguments ~~~~~~~~~")
     print(f"input_file={input_file}")
@@ -401,13 +418,14 @@ def main():
     tissue=inherited_options.tissue
     tissue_col=inherited_options.tissue_col
     label_group_col=inherited_options.label_group_col
+    sample_col=inherited_options.sample_col
     print(f"~~~~~~~ TISSUE:{tissue}")
     print(f"~~~~~~~ TISSUE_col:{tissue_col}")
     print(f"~~~~~~~ GROUP_col:{label_group_col}")
     
     # Do we have a GPU?
-    use_gpu = torch.cuda.is_available()
-    print(f"Is there a GPU available?: {use_gpu}")
+    #use_gpu = torch.cuda.is_available()
+    #print(f"Is there a GPU available?: {use_gpu}")
 
     # Get basedir - modified to run in current dir
     # outdir = os.path.dirname(os.path.commonprefix([input_file]))
@@ -452,9 +470,9 @@ def main():
     tissues = np.unique(adata.obs[tissue_col])
     #for t in tissues:
     #    tempt = adata.obs[adata.obs[tissue_col] == t]
-    #    print(f"For {t}, there is {len(np.unique(tempt['sanger_sample_id']))} samples. A total of {tempt.shape[0]} cells")
+    #    print(f"For {t}, there is {len(np.unique(tempt[sample_col]))} samples. A total of {tempt.shape[0]} cells")
     #    cd = tempt[tempt['disease_status'] == "CD"]
-    #    print(f"{len(np.unique(cd['sanger_sample_id']))} are CD")
+    #    print(f"{len(np.unique(cd[sample_col]))} are CD")
     #    del tempt
         
     # Also save the gene var df
@@ -483,7 +501,7 @@ def main():
     adata.obs['log_total_counts'] = np.log10(adata.obs['total_counts'])
     
     # Remove samples with fewer than X cells. Important if doing relative QC
-    adata.obs['samp_tissue'] = adata.obs['sanger_sample_id'].astype('str') + "_" + adata.obs[tissue_col].astype('str')
+    adata.obs['samp_tissue'] = adata.obs[sample_col].astype('str') + "_" + adata.obs[tissue_col].astype('str')
     samp_data = np.unique(adata.obs.samp_tissue, return_counts=True)
     cells_sample = pd.DataFrame({'sample': samp_data[0], 'Ncells':samp_data[1]})
     chuck = cells_sample.loc[cells_sample['Ncells'] < min_ncells_per_sample, 'sample'].values
@@ -563,8 +581,8 @@ def main():
 
     # Plot the distribution per tissue
     cols_to_plot = ["nCells", "Median_nCounts", "Median_nGene_by_counts", "Median_MT"]
-    adata.obs['disease_tissue'] = adata.obs[tissue_col].astype(str) + "_" + adata.obs['disease_status'].astype(str)
-    td = np.unique(adata.obs['disease_tissue'])
+    #adata.obs['disease_tissue'] = adata.obs[tissue_col].astype(str) + "_" + adata.obs['disease_status'].astype(str)
+    td = np.unique(adata.obs['disease_tissue'].astype(str))
     if plot_per_samp_qc == "yes":
         for c in cols_to_plot:
             print(c)
@@ -580,7 +598,6 @@ def main():
             plt.clf()
             
         # Also have a look by tissue x disease
-        td = np.unique(adata.obs['disease_tissue'])
         for c in cols_to_plot:
             print(c)
             plt.figure(figsize=(8, 6))
@@ -779,7 +796,7 @@ def main():
             remaining_df = pivot_df.drop(exclude)
             if remaining_df.shape[0] > 50:
                 remaining_df = remaining_df.sample(n=50, random_state=17)
-        
+            
             combined_df = pd.concat([excluded_df, pd.DataFrame([np.nan] * len(pivot_df.columns)).T, remaining_df])
             combined_df.index = list(exclude) + [''] + list(remaining_df.index)
             bottom = np.zeros(len(combined_df))
@@ -788,12 +805,12 @@ def main():
                 bottom += combined_df[category].fillna(0).values
             #
             ax.legend(title=label_group_col, bbox_to_anchor=(1.05, 1), loc='upper left')
-            ax.set_title('Relative Proportions of Category__Machine by Samp_Tissue')
+            ax.set_title(f'Relative Proportions of {label_group_col} by Samp_Tissue')
             ax.set_xlabel('Samp_Tissue')
             ax.set_ylabel('Proportion')
             ax.set_xticks([])
             plt.title(f"{t} : Left = excluded, Right = 50 non-excluded samples")
-            plt.savefig(f"{qc_path}/category_proportions_across_{t}_samples_absolute_min_nGene.png", bbox_inches='tight')
+            plt.savefig(f"{qc_path}/{label_group_col}_proportions_across_{t}_samples_absolute_min_nGene.png", bbox_inches='tight')
             plt.clf()
             # Also make a PCA and colour by whether the samples are in the excluded set or not
             pca = PCA(n_components=2)
@@ -812,7 +829,7 @@ def main():
             #
             plt.xlabel('Cell contribution PC 1')
             plt.ylabel('Cell contribution PC 1')
-            plt.title(f'{t} - PCA of category__machine proportions')
+            plt.title(f'{t} - PCA of {label_group_col} proportions')
             plt.savefig(f"{qc_path}/pca_cell_contributions_{t}_absolute_min_nGene.png", bbox_inches='tight')
             plt.clf()        
         
@@ -888,7 +905,7 @@ def main():
     #### Expression Normalisation ######
     ####################################
     print("~~~~~~~~~~~~ Conducting expression normalisation ~~~~~~~~~~~~~")
-    sc.pp.filter_genes(adata, min_cells=5)
+    sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
     print("Filtered genes")
 
     # Keep a copy of the raw counts
@@ -935,6 +952,7 @@ def main():
         sc.pp.highly_variable_genes(adata, flavor="seurat", layer="log1p_cp10k", n_top_genes=int(n_variable_genes), subset=True)
     else:
         sc.pp.highly_variable_genes(adata, flavor="seurat", layer="log1p_cp10k", batch_key=hvgs_within, n_top_genes=int(n_variable_genes), subset=True)
+    
     print("Found highly variable")
 
     # Check for intersection of IG, MT and RP genes in the HVGs
@@ -953,10 +971,8 @@ def main():
     # Print the final shape of the high QC data
     print(f"The final shape of the high QC data is: {adata.shape}")
     for t in tissues:
-     tempt = adata.obs[adata.obs[tissue_col] == t]
-     print(f"For {t}, there is {len(np.unique(tempt['sanger_sample_id']))} samples. A total of {tempt.shape[0]} cells")
-     cd = tempt[tempt['disease_status'] == "CD"]
-     print(f"{len(np.unique(cd['sanger_sample_id']))} are CD")
+        tempt = adata.obs[adata.obs[tissue_col] == t]
+        print(f"For {t}, there is {len(np.unique(tempt[sample_col]))} samples. A total of {tempt.shape[0]} cells")
 
     if pref_matrix not in ["scVI", "scANVI"]:
         # Only need to compute PCA if we know the data is going to be Harmony'd, or bbknn'd

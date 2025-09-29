@@ -11,8 +11,8 @@ print(cwd)
 
 # Load packages
 import sys
-sys.path.append('/software/team152/bh18/pip')
-sys.path.append('/usr/local/')
+#sys.path.append('/software/team152/bh18/pip')
+#sys.path.append('/usr/local/')
 print("System path")
 print(sys.path)
 import numpy as np
@@ -144,7 +144,7 @@ def main():
         scvi.settings.dl_pin_memory_gpu_training =  use_gpu
         scvi.model.SCVI.setup_anndata(adata, layer="counts", batch_key=batch_column)
         model = scvi.model.SCVI(adata, n_layers=2, n_latent=30, gene_likelihood="nb")
-        model.train(use_gpu=use_gpu)
+        model.train() # Sometimes this will fail if a batch is a single sample. If so, increase this: batch_size=256
         SCVI_LATENT_KEY = "X_scVI"
         adata.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
         sparse_matrix = sp.sparse.csc_matrix(adata.obsm[SCVI_LATENT_KEY])
