@@ -71,9 +71,8 @@ for g in genes:
 # Dotplot for the canonical markers
 ###########################
 # Also plot a dotplot
-major = {"Epithelial": ["EPCAM" ,'CDH1', 'KRT19', 'EPCAM'], "Mesenchymal": ["COL1A1","COL1A2","COL6A2","VWF"], 'Immune':['PTPRC'], 'B':['CD79A', 'MS4A1', 'MS4A1', 'CD79B'], 'Plasma':['MZB1', 'JCHAIN'], 'T':['CD3D', 'CD3E', 'CD3G','CCR7','IL7R', 'TRAC'], 'Myeloid':['ITGAM', 'CD14', 'CSF1R', 'TYROBP'], 'DC':['ITGAX', 'CLEC4C','CD1C', 'FCER1A', 'CLEC10A'], 'Mac':['APOE', 'C1QA', 'CD68','AIF1'], 'Mono':['FCN1','S100A8', 'S100A9', "CD14", "FCGR3A", 'LYZ'], 'Mast':["TPSAB1", 'TPSB2', "CPA3" ], 'Platelet+RBC':['GATA1', 'TAL1', 'ITGA2B', 'ITGB3']}
-sc.pl.dotplot(adata, major, layer="log1p_cp10k", gene_symbols = "gene_symbols", groupby='IBDverse_eqtl:Category', dendrogram=False, save="_major_markers.png")
-
+major = {"Epithelial": ["EPCAM" ,'CDH1', 'KRT19', 'EPCAM'], "Mesenchymal": ["COL1A1","COL1A2","COL6A2","VWF"], 'B':['CD79A', 'MS4A1', 'MS4A1', 'CD79B'], 'Plasma':['MZB1', 'JCHAIN'], 'T/ILC':['CD3D', 'CD3E', 'CD3G','CCR7','IL7R', 'TRAC'], 'Myeloid':['ITGAM', 'CD14', 'CSF1R', 'TYROBP'], 'Mast':["TPSAB1", 'TPSB2', "CPA3" ], 'Platelet':["RUNX1","GATA2","HDC","SLC24A3"]}
+sc.pl.dotplot(adata, major, layer="log1p_cp10k", gene_symbols = "gene_symbols", groupby='IBDverse_eqtl:Category', standard_scale='var', dendrogram=False, save="_major_markers.png")
 
 ###########################
 # Checking the non-immune populations
