@@ -15,6 +15,9 @@ from h5py import File
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.anova import anova_lm
 
 
 ####################
@@ -109,15 +112,20 @@ obs = read_elem(f2['obs'])
 ##################
 # Add some derived covariates to .obs
 ##################
-# Annotate .obs with the number of samples in each pool
-poolcount = pd.DataFrame(obs[['convoluted_samplename', 'pool_participant']].groupby('convoluted_samplename').nunique()).reset_index()
+# Annotate .obs with the number of samples in each pool (make sure this comes from the wetlab metadata, not the .obs itself, as this is filtered for perfect matches)
+wetlab_meta = pd.read_csv(nonmerged_wetlab_meta)
+wetlab_meta = wetlab_meta[~(wetlab_meta['Sequencing_ID'] == "Not_sequenced")]
+wetlab_meta = wetlab_meta[~(wetlab_meta['Sequencing_ID'].isna())]
+wetlab_meta['pool_participant'] = wetlab_meta['Sequencing_ID'].astype(str) + "_" + wetlab_meta['Participant_Study_ID'].astype(str)
+wetlab_meta = wetlab_meta.rename(columns={'Sequencing_ID': 'convoluted_samplename'})
+poolcount = pd.DataFrame(wetlab_meta[['convoluted_samplename', 'pool_participant']].groupby('convoluted_samplename').nunique()).reset_index()
 poolcount.columns = ['convoluted_samplename', 'num_samples_in_pool']
 obs = obs.merge(poolcount, on='convoluted_samplename', how='left')
 
 plt.figure(figsize=(8,6))
 sns.histplot(poolcount['num_samples_in_pool'].dropna(), bins=40, kde=False)
-plt.title(f'Distribution of Num Samples In Pool (days)')
-plt.xlabel('Days')
+plt.title(f'Distribution of Num Samples In Pool')
+plt.xlabel('Number of Samples')
 plt.ylabel('Count')
 plt.savefig(f'{outdir}/num_samples_in_pool_hist.png')
 plt.close()
@@ -137,16 +145,25 @@ celltype_counts['proportion'] = celltype_counts['count'] / celltype_counts['tota
 celltype_counts_add = celltype_counts[['pool_participant', 'IBDverse_eqtl:Category', 'proportion']].pivot(index='pool_participant', columns='IBDverse_eqtl:Category', values='proportion').reset_index()
 obs = obs.merge(celltype_counts_add, on='pool_participant', how='left')
 
+
+# Manually correct some errors
+obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'].astype('string')
+mask = (obs['convoluted_samplename'] == "IBD-RESPONSE13764153") & (obs['participant_id'] == "CAM0046") # Typo of the month, updated in newest version of the metadata
+obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2023-04-13"
+mask = (obs['convoluted_samplename'] == "IBD-RESPONSE14552622") & (obs['participant_id'] == "OXF0006") # Typo of the month, updated in newest version of the metadata
+obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2023-11-08"
+mask = (obs['convoluted_samplename'] == "IBD-RESPONSE15443671")  # Typo of the days, so was received before collected
+obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2025-01-16"
+
 # And the time between dispatch and delivery (in days)
 date_cols = ['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.', 'meta-Date_of_shipment', 'meta-Sample_Collection']
 for col in date_cols:
     obs[col] = pd.to_datetime(obs[col].astype('string'), errors='coerce')
 
+# Extract the info per sample to plot
 obs['collection_to_wetlab'] = (obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] - obs['meta-Sample_Collection']).dt.days
 obs['shipment_to_wetlab'] = (obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] - obs['meta-Date_of_shipment']).dt.days
 test_collection_to_wetlab = obs[['convoluted_samplename', 'participant_id', 'meta-Date_of_shipment', 'meta-date_blood_sent_sanger', 'meta-Sample_Collection', 'meta-blood_date_collected', 'meta-Sender', 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.', 'collection_to_wetlab', 'shipment_to_wetlab']].drop_duplicates().reset_index(drop=True)
-test_collection_to_wetlab = test_collection_to_wetlab[test_collection_to_wetlab['collection_to_wetlab'] > 0] # There is one typo causing negative value, but have checked and it is okay
-test_collection_to_wetlab = test_collection_to_wetlab[test_collection_to_wetlab['collection_to_wetlab'] < 30] # Also another typo for a sample which looks to have taken > 1 month
 
 # Distribution of collection_to_wetlab (days)
 plotcols = ['shipment_to_wetlab', 'collection_to_wetlab']
@@ -316,7 +333,7 @@ for label in labels:
 
 # Manually inspect results
 results_all = pd.concat(results_list, ignore_index=True)
-results_all[results_all['p_value'] < 0.05].sort_values('p_value').shape[0] # 29
+results_all[results_all['p_value_adj'] < 0.05].sort_values('p_value').shape[0] # 15
 
 
 ##################
@@ -476,8 +493,9 @@ for pc in heat_r2_t.index:
         p_val = heat_p_t.loc[pc, predictor]
         annot.loc[pc, predictor] = '*' if (pd.notna(p_val) and p_val < 0.05) else ''
 
-
-annot = np.asarray(annot, dtype=str)
+# Keep both as DataFrames for proper alignment in seaborn
+annot = annot.astype(str)
+heat_r2_plot = heat_r2_t.fillna(0)
 
 plt.figure(figsize=(0.8 * len(meta_cols), 0.25 * len(pcs_use) + 4))
 sns.heatmap(
@@ -495,3 +513,91 @@ plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
 plt.savefig(f'{outdir}/pc_predictor_r2_heatmap.png')
 plt.close()
+
+###############
+# Do some more formal association testing - Linear model per cell-type (sample-level CLR)
+# y ~ response + num_samples_in_pool + collection_to_wetlab
+###############
+other_variables = ['num_samples_in_pool', 'collection_to_wetlab']
+label_lm = 'Celltypist:IBDverse_eqtl:predicted_labels'
+group_col_lm = 'pool_participant'
+target_vars = ["meta-Diagnosis", "meta-W14_RESPONSE"]
+
+# Build CLR per sample
+ca_sample_lm = build_ca(obs, label=label_lm, group_col=group_col_lm)
+sample_meta_lm = obs[[group_col_lm] + target_vars + other_variables].drop_duplicates().reset_index(drop=True)
+ca_sample_lm = ca_sample_lm.merge(sample_meta_lm, on=group_col_lm, how='left')
+
+lm_results = []
+target = target_vars[0]
+target_var_format = target.replace("meta-", "")
+
+celltypes = ca_sample_lm[label_lm].dropna().unique()
+for target in target_vars:
+    print(f"*** testing {target} ***")
+    target_var_format = target.replace("meta-", "")
+    for celltypelabel in celltypes:
+        print(f"... cell type: ", celltypelabel)
+        subset = ca_sample_lm[ca_sample_lm[label_lm] == celltypelabel].copy()
+        subset = subset[['proportion_clr'] + target_vars + other_variables].dropna()
+        subset = subset.rename(columns={target: target_var_format})
+        # require at least 3 observations and >=2 response levels
+        if subset.shape[0] < 3 or subset[target_var_format].nunique() < 2:
+            lm_results.append({
+                'celltypelabel': celltypelabel,
+                'n': int(subset.shape[0]),
+                'p_response': np.nan,
+                'coef_num_samples_in_pool': np.nan,
+                'p_num_samples_in_pool': np.nan,
+                'coef_collection_to_wetlab': np.nan,
+                'p_collection_to_wetlab': np.nan,
+                'r2': np.nan
+            })
+            continue
+        try:
+            if subset[target_var_format].nunique() == 2:
+                subset['_target_bin'] = pd.Categorical(subset[target_var_format]).codes
+                formula = "_target_bin ~ proportion_clr + num_samples_in_pool + collection_to_wetlab"
+                model = smf.logit(formula, data=subset).fit(disp=False)
+                lm_results.append({
+                    'celltypelabel': celltypelabel,
+                    'target': target,
+                    'model': formula,
+                    'n': int(subset.shape[0]),
+                    'coef_target': model.params.get('proportion_clr', np.nan),
+                    'p_target': model.pvalues.get('proportion_clr', np.nan),
+                    'r2': model.prsquared
+                })
+            else:
+                formula = f"proportion_clr ~ C({response_var_format}) + num_samples_in_pool + collection_to_wetlab"
+                model = smf.ols(formula, data=subset).fit()
+                anova_res = anova_lm(model, typ=2)
+                p_response = anova_res.loc[f"C({response_var_format})", 'PR(>F)'] if f"C({response_var_format})" in anova_res.index else np.nan
+                lm_results.append({
+                    'celltypelabel': celltypelabel,
+                    'target': target,
+                    'model': formula,
+                    'n': int(subset.shape[0]),
+                    'coef_target': model.params.get('proportion_clr', np.nan),
+                    'p_target': model.pvalues.get('proportion_clr', np.nan),
+                    'r2': model.prsquared
+                })
+        except Exception:
+            lm_results.append({
+                'celltypelabel': celltypelabel,
+                'n': int(subset.shape[0]),
+                'p_response': np.nan,
+                'coef_num_samples_in_pool': np.nan,
+                'p_num_samples_in_pool': np.nan,
+                'coef_collection_to_wetlab': np.nan,
+                'p_collection_to_wetlab': np.nan,
+                'r2': np.nan
+            })
+
+lm_results_df = pd.DataFrame(lm_results)
+lm_results_df["p_target_adj"] = lm_results_df.groupby("target")["p_target"].transform(lambda p: sm.stats.multipletests(p, method="fdr_bh")[1])
+
+lm_results_df.to_csv(
+    f'{outdir}/celltype_clr_linear_model_results.csv',
+    index=False
+)
