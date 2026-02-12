@@ -18,6 +18,7 @@ from scipy import stats
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.anova import anova_lm
+from matplotlib.lines import Line2D
 
 
 ####################
@@ -99,13 +100,57 @@ def permutation_pvalue(pc_meta_df, predictor, evr, n_perm=1000, seed=1):
 ####################
 # Options
 ####################
-h5ad="/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/atlassing_IBDR/results/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/objects/adata_PCAd_batched_umap.h5ad"
+h5ad="results/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/objects/adata_PCAd_batched_umap.h5ad"
 outdir="results/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/figures/check_QC"
 nonmerged_wetlab_meta="/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/IBDR_prep/processed_data/wetlab_metadata/2026-01-26-WETLAB-IBD-R_Sample_Record.csv"
+repo_dir = "/lustre/scratch127/humgen/projects_v2/sc-eqtl-ibd/analysis/bradley_analysis/IBDverse/IBDVerse-sc-eQTL-code/"
+palette = pd.read_csv(f"{repo_dir}/data/palette.csv")
+color_map = dict(zip(palette['category'], palette['category_color']))
+annot_mapping = pd.read_csv(f"{repo_dir}/data/all_IBDverse_annotation_mastersheet.csv")
+annot_mapping = annot_mapping.rename(
+    columns={
+        "leiden": "label_machine",
+        "JAMBOREE_ANNOTATION": "label_new",
+        "Category": "category"
+    }
+)
+annot_mapping['label_new'] = annot_mapping['label_new'].replace({"_": " "}, regex=True)
+level_mapping = {
+    '0': 'All Cells',
+    '1': 'Major population',
+    '2': 'Cell type'
+}
+tissue_mapping = {
+    'ct': 'Cross-site',
+    'ti': 'Terminal ileum',
+    'r': 'Rectum',
+    'blood': 'Blood'
+}
+annot_mapping = annot_mapping.copy()
+annot_mapping['Level'] = 2
+cat_col = 'category_new' if 'category_new' in annot_mapping.columns else 'category'
+major = annot_mapping[[cat_col]].dropna().drop_duplicates()
+major['label_new'] = major[cat_col]
+major['label_machine'] = major[cat_col]
+major['Level'] = 1
+annot_mapping = annot_mapping[major.columns]
+annot_mapping = pd.concat([annot_mapping, major], ignore_index=True, sort=False)
+annot_mapping = annot_mapping.dropna()
+unannotated = {
+    'label_machine': 'unannotated',
+    'label_new': level_mapping['0'],
+    cat_col: level_mapping['0'],
+    'Level': 0
+}
+annot_mapping = pd.concat([annot_mapping, pd.DataFrame([unannotated])], ignore_index=True, sort=False)
+tissue_df = pd.DataFrame({'tissue': list(tissue_mapping.keys())})
+annot_mapping = annot_mapping.assign(_key=1).merge(tissue_df.assign(_key=1), on='_key').drop(columns=['_key'])
+annot_mapping['label_machine'] = annot_mapping['label_machine'].astype(str) + '_' + annot_mapping['tissue'].astype(str)
+annot_mapping['tissue'] = annot_mapping['tissue'].map(tissue_mapping)
+annot_mapping['annotation_type'] = annot_mapping['Level'].map({0: 'All Cells', 1: 'Major population', 2: 'Cell type'})
 
 ####################
 # Import the .obs from the post-QC h5ad
-h5ad="/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/atlassing_IBDR/results/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/objects/adata_PCAd_batched_umap.h5ad"
 f2 = File(h5ad, 'r')
 obs = read_elem(f2['obs'])
 
@@ -212,6 +257,37 @@ for metric in qc_metrics:
     plt.ylabel(metric)
     plt.savefig(f'{outdir}/qc_{metric}_boxplot.png')
     plt.close()
+    
+    
+# Compare the per-sample number of samples in pool with the collection to wetlab
+spec_comp = obs[['pool_participant', 'num_samples_in_pool', 'collection_to_wetlab']].drop_duplicates()
+plt.figure(figsize=(8,6))
+valid = spec_comp[['collection_to_wetlab', 'num_samples_in_pool']].dropna()
+sns.histplot(
+    data=valid,
+    x='collection_to_wetlab',
+    y='num_samples_in_pool',
+    bins=30,
+    cmap='viridis',
+    cbar=True
+)
+mask = np.isfinite(spec_comp['collection_to_wetlab']) & np.isfinite(spec_comp['num_samples_in_pool'])
+if mask.sum() >= 3:
+    x = spec_comp.loc[mask, 'collection_to_wetlab'].astype(float).values
+    y = spec_comp.loc[mask, 'num_samples_in_pool'].astype(float).values
+    slope, intercept = np.polyfit(x, y, 1)
+    x_line = np.linspace(np.min(x), np.max(x), 100)
+    y_line = slope * x_line + intercept
+    plt.plot(x_line, y_line, color='red', linestyle='--', linewidth=1.5)
+    rho, pval = stats.pearsonr(x, y)
+    plt.text(0.02, 0.98, f'r={rho:.3f}, p={pval:.3e}', transform=plt.gca().transAxes,
+             ha='left', va='top', fontsize=15)
+
+plt.xlabel('collection_to_wetlab')
+plt.ylabel('num_samples_in_pool')
+plt.tight_layout()
+plt.savefig(f'{outdir}/scatter_collection_to_wetlab_vs_num_samples_in_pool.png')
+plt.close()
     
 ##################
 # Look more strictly at cell-type abundances
@@ -334,6 +410,49 @@ for label in labels:
 # Manually inspect results
 results_all = pd.concat(results_list, ignore_index=True)
 results_all[results_all['p_value_adj'] < 0.05].sort_values('p_value').shape[0] # 15
+
+# Plot a volcano of these results
+results_all = results_all.merge(annot_mapping[['label_new', 'category', 'annotation_type']].drop_duplicates(), left_on="celltypelabel", right_on="label_new", how='left')
+
+for predictor in results_all['predictor'].dropna().unique():
+    sub = results_all[results_all['predictor'] == predictor].copy()
+    sub = sub[np.isfinite(sub['slope']) & np.isfinite(sub['p_value'])]
+    if sub.shape[0] == 0:
+        continue
+    sub['point_color'] = np.where(
+        sub['p_value_adj'] < 0.05,
+        sub['category'].map(color_map).fillna('#9e9e9e'),
+        '#9e9e9e'
+    )
+    size_map = {'Cell type': 100, 'Major population': 200, 'All Cells': 400}
+    sub['point_size'] = sub['annotation_type'].map(size_map).fillna(25)
+    sub['neglog10_p'] = -np.log10(sub['p_value'])
+    plt.figure(figsize=(8, 6))
+    plt.scatter(sub['slope'], sub['neglog10_p'], c=sub['point_color'], s=sub['point_size'], alpha=0.8)
+    # Label significant points
+    sig = sub[sub['p_value_adj'] < 0.05]
+    for _, row in sig.iterrows():
+        plt.text(row['slope'], row['neglog10_p'], str(row['celltypelabel']), fontsize=7, alpha=0.9)
+    plt.xlabel('Slope')
+    plt.ylabel('-log10(p-value)')
+    plt.title(str(predictor))
+    # Build legends for color (categories) and size (annotation_type)
+    from matplotlib.lines import Line2D
+    sig_cats = sub.loc[sub['p_value_adj'] < 0.05, 'category'].dropna().unique().tolist()
+    color_handles = [Line2D([0], [0], marker='o', color='w', label=cat,
+                markerfacecolor=color_map.get(cat, '#9e9e9e'), markersize=8)
+            for cat in sig_cats]
+    color_handles.append(Line2D([0], [0], marker='o', color='w', label='Not significant',
+                    markerfacecolor='#9e9e9e', markersize=8))
+    size_handles = [Line2D([0], [0], marker='o', color='w', label=lbl,
+                    markerfacecolor='#666666', markersize=np.sqrt(sz))
+                for lbl, sz in size_map.items()]
+    first_legend = plt.legend(handles=color_handles, title='Major pop. (p_adj<0.05)', loc='upper right', frameon=True)
+    plt.gca().add_artist(first_legend)
+    plt.legend(handles=size_handles, title='Annotation type', loc='lower right', frameon=True)
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/volcano_{predictor}.png")
+    plt.close()
 
 
 ##################
@@ -516,7 +635,7 @@ plt.close()
 
 ###############
 # Do some more formal association testing - Linear model per cell-type (sample-level CLR)
-# y ~ response + num_samples_in_pool + collection_to_wetlab
+# response ~ clr + num_samples_in_pool + collection_to_wetlab
 ###############
 other_variables = ['num_samples_in_pool', 'collection_to_wetlab']
 label_lm = 'Celltypist:IBDverse_eqtl:predicted_labels'
@@ -529,8 +648,6 @@ sample_meta_lm = obs[[group_col_lm] + target_vars + other_variables].drop_duplic
 ca_sample_lm = ca_sample_lm.merge(sample_meta_lm, on=group_col_lm, how='left')
 
 lm_results = []
-target = target_vars[0]
-target_var_format = target.replace("meta-", "")
 
 celltypes = ca_sample_lm[label_lm].dropna().unique()
 for target in target_vars:
@@ -564,6 +681,7 @@ for target in target_vars:
                     'target': target,
                     'model': formula,
                     'n': int(subset.shape[0]),
+                    'intercept': model.params.get('Intercept', np.nan),
                     'coef_target': model.params.get('proportion_clr', np.nan),
                     'p_target': model.pvalues.get('proportion_clr', np.nan),
                     'r2': model.prsquared
@@ -578,6 +696,7 @@ for target in target_vars:
                     'target': target,
                     'model': formula,
                     'n': int(subset.shape[0]),
+                    'intercept': model.params.get('Intercept', np.nan),
                     'coef_target': model.params.get('proportion_clr', np.nan),
                     'p_target': model.pvalues.get('proportion_clr', np.nan),
                     'r2': model.prsquared
@@ -601,3 +720,49 @@ lm_results_df.to_csv(
     f'{outdir}/celltype_clr_linear_model_results.csv',
     index=False
 )
+
+# Plot any significant results
+sig_results = lm_results_df[lm_results_df['p_target'] < 0.05]
+for _, row in sig_results.iterrows():
+    celltypelabel = row['celltypelabel']
+    target_var = row['target']
+    subset = ca_sample_lm[ca_sample_lm[label_lm] == celltypelabel]
+    # skip empty subsets
+    if subset.shape[0] == 0:
+        continue
+    plt.figure(figsize=(8,6))
+    # prepare category order (string) so violin/strip align
+    uniq = sorted(subset[target_var].dropna().unique())
+    order = [str(x) for x in uniq]
+    # violin plot (no inner points)
+    sns.violinplot(x=subset[target_var].astype(str), y='proportion_clr', data=subset, order=order, inner=None, color='lightgray')
+    # jittered points on top
+    sns.stripplot(x=subset[target_var].astype(str), y='proportion_clr', data=subset, order=order, jitter=0.25, size=4, color='black', alpha=0.6)
+    # Plot regression line mapped to category positions
+    x_pos = np.arange(len(uniq))
+    y_pred = [row['intercept'] + row['coef_target'] * v for v in x_pos]
+    # Add median and IQR as horizontal lines per pool size
+    ax = plt.gca()
+    for i, value in enumerate(uniq):
+        pool_data = subset[subset[target_var] == value]['proportion_clr']
+        med = pool_data.median()
+        q25 = pool_data.quantile(0.25)
+        q75 = pool_data.quantile(0.75)
+        # Draw median as solid line
+        ax.hlines(med, i - 0.4, i + 0.4, colors='blue', linewidth=2, linestyle='-', label='Median' if i == 0 else '')
+        # Draw IQR bounds as dashed lines
+        ax.hlines(q25, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--', label='IQR' if i == 0 else '')
+        ax.hlines(q75, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--')
+    plt.xlabel(target_var.replace("_", " "))
+    plt.title(f'CLR of {celltypelabel} vs {target_var.replace("_", " ")}\n p={row["p_target"]:.3e}, slope={row["coef_target"]:.3f}')
+    plt.ylabel('CLR Proportion')
+    celltypelabel = str(celltypelabel).replace('/', '.')
+    plt.savefig(f'{outdir}/{label}_{celltypelabel}_clr_vs_{target_var}.png')
+    plt.close() 
+    
+    
+    
+##################
+# Calculate the amount of variance in gene expression that is explained by the technical factors
+# + compare this with the amount of variance explained by these factors on cell abundances (CLR)
+##################
