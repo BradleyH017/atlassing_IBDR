@@ -149,6 +149,12 @@ def main():
         adata.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
         sparse_matrix = sp.sparse.csc_matrix(adata.obsm[SCVI_LATENT_KEY])
         sp.sparse.save_npz(f"results/{tissue}/tables/batch_correction/scVI_matrix.npz", sparse_matrix)
+        # Also get the normalised expression and save both this and the model
+        adata.obsm[f"{SCVI_LATENT_KEY}-normalised"] = model.get_normalized_expression()
+        sparse_expr_matrix = sp.sparse.csc_matrix(adata.obsm[f"{SCVI_LATENT_KEY}-normalised"])
+        sp.sparse.save_npz(f"results/{tissue}/tables/batch_correction/scVI_normalised_matrix.npz", sparse_expr_matrix)
+        # Save model
+        model.save(f"results/{tissue}/tables/batch_correction/scVI_model.pt")
     
     
     if "scVI_default" in batch_correction:

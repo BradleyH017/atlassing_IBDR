@@ -1,6 +1,6 @@
 # Define which round of the analysis this is - will alter config and original input file
 configfile: "configs/config.yaml" # round1
-input0 = expand("input_temp/adata_raw_input_{tissue}.h5ad", tissue=config["tissue"])
+input0 = expand("input/adata_raw_input_{tissue}.h5ad", tissue=config["tissue"])
 envvars:
     "SINGULARITYENV_LD_LIBRARY_PATH"
 
@@ -56,9 +56,9 @@ rule qc_raw:
         calc_hvgs_together=config["calc_hvgs_together"],
         min_cells_per_gene=config["min_cells_per_gene"]
     resources:
-        queue='normal',
-        mem_mb=50000,
-        disk_mb=50000
+        queue='teramem',
+        mem_mb=750000,
+        disk_mb=750000
     singularity:
         "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
@@ -111,7 +111,9 @@ if "scVI" in batch_methods:
         input:
             "results/{tissue}/objects/adata_PCAd.h5ad"
         output:
-            "results/{tissue}/tables/batch_correction/scVI_matrix.npz"
+            "results/{tissue}/tables/batch_correction/scVI_matrix.npz",
+            "results/{tissue}/tables/batch_correction/scVI_normalised_matrix.npz",
+            "results/{tissue}/tables/batch_correction/scVI_model.pt"
         singularity:
             "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         params:
@@ -119,8 +121,8 @@ if "scVI" in batch_methods:
             correct_variable_only=config["correct_variable_only"],
         resources:
             queue='gpu-normal -gpu - -m "farm22-gpu0203 farm22-gpu0204"', # Should be gpu-huge
-            mem_mb=15000, # 250000
-            disk_mb=15000
+            mem_mb=60000, # 250000
+            disk_mb=60000
         shell:
             r"""
             mkdir -p results/{wildcards.tissue}/tables/batch_correction
@@ -281,9 +283,9 @@ else:
         singularity:
             "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
         resources:
-            queue='normal', # 
-            mem_mb=15000, # 150000
-            disk_mb=15000
+            queue='teramem', # 
+            mem_mb=750000, # 750000
+            disk_mb=750000
         shell:
             r"""
             echo X_{params.method} >> {output[0]}
@@ -403,8 +405,8 @@ rule get_umap:
         col_by=config["col_by"]
     resources:
         queue='normal',
-        mem_mb=20000, # 200000
-        disk_mb=20000
+        mem_mb=50000, # 750000
+        disk_mb=50000
     singularity:
             "/software/hgi/softpack/installs/users/eh19//test-scvi-reserve/33-scripts/singularity.sif"
     shell:
@@ -428,9 +430,9 @@ rule cluster_array:
         "results/{tissue}/tables/clustering_array/leiden_{clustering_resolution}/clusters.csv",
         "results/{tissue}/tables/clustering_array/leiden_{clustering_resolution}/umap_clusters_res{clustering_resolution}.png"
     resources:
-        queue='normal',
-        mem_mb=20000, # 150000
-        disk_mb=20000
+        queue='teramem',
+        mem_mb=750000, # 750000
+        disk_mb=750000
     singularity:
         "/software/hgi/softpack/installs/users/bh18//pascient/2-scripts/singularity.sif"
     shell:
