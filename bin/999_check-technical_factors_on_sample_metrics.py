@@ -20,272 +20,20 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.anova import anova_lm
 from matplotlib.lines import Line2D
-
-
-####################
-# Define custom functions
-####################
-def build_ca(df, label, group_col):
-    ca_local = df[[group_col, label]].groupby([group_col, label]).size().reset_index()
-    ca_local.columns = [group_col, label, 'count']
-    total_cells = df[[group_col]].groupby(group_col).size().reset_index()
-    total_cells.columns = [group_col, 'total_cells']
-    ca_local = ca_local.merge(total_cells, on=group_col, how='left')
-    ca_local['proportion'] = ca_local['count'] / ca_local['total_cells']
-    # small pseudocount to avoid log(0)
-    eps = 1e-6
-    prop_pivot = ca_local.pivot_table(index=group_col, columns=label, values='proportion', aggfunc='sum', fill_value=0)
-    prop_pivot = prop_pivot.clip(lower=eps)
-    log_prop = np.log(prop_pivot)
-    clr_pivot = log_prop.subtract(log_prop.mean(axis=1), axis=0)
-    clr_long = clr_pivot.reset_index().melt(id_vars=group_col, var_name=label, value_name='proportion_clr')
-    ca_local = ca_local.merge(clr_long, on=[group_col, label], how='left')
-    return ca_local
-
-def _is_categorical(series):
-    return (
-        pd.api.types.is_object_dtype(series)
-        or pd.api.types.is_categorical_dtype(series)
-        or pd.api.types.is_bool_dtype(series)
-    )
-
-def _r2_for_predictor(y, x, categorical=False):
-    mask = np.isfinite(y) & pd.notna(x)
-    if mask.sum() < 3:
-        return np.nan
-    y = y[mask]
-    x = x[mask]
-    if categorical:
-        # one-way ANOVA R^2 (eta^2)
-        groups = [y[x == lvl] for lvl in pd.unique(x) if np.sum(x == lvl) > 0]
-        if len(groups) < 2:
-            return np.nan
-        ss_total = np.sum((y - np.mean(y)) ** 2)
-        ss_between = np.sum([len(g) * (np.mean(g) - np.mean(y)) ** 2 for g in groups])
-        return ss_between / ss_total if ss_total > 0 else np.nan
-    # numeric: R^2 via correlation
-    if np.std(x) == 0:
-        return np.nan
-    r = np.corrcoef(y, x)[0, 1]
-    return r ** 2
-
-def _weighted_r2(pc_meta_df, predictor, evr, pc_cols=None):
-    # Use provided PC columns or infer from dataframe
-    if pc_cols is None:
-        pc_cols = [col for col in pc_meta_df.columns if col.startswith('PC') and col[2:].isdigit()]
-    
-    x = pc_meta_df[predictor]
-    categorical = _is_categorical(x)
-    r2s = []
-    for pc in pc_cols:
-        if pc in pc_meta_df.columns:
-            y = pc_meta_df[pc].to_numpy(dtype=float)
-            r2s.append(_r2_for_predictor(y, x, categorical=categorical))
-        else:
-            break
-    r2s = np.array(r2s, dtype=float)
-    valid = np.isfinite(r2s)
-    if valid.sum() == 0:
-        return np.nan
-    # Use only the EVR for PCs that were actually computed
-    w = evr[:len(r2s)][valid]
-    w = w / w.sum()
-    return np.sum(r2s[valid] * w)
-
-def permutation_pvalue(pc_meta_df, predictor, evr, n_perm=1000, seed=1, pc_cols=None):
-    rng = np.random.default_rng(seed)
-    obs_stat = _weighted_r2(pc_meta_df, predictor, evr, pc_cols=pc_cols)
-    if not np.isfinite(obs_stat):
-        return np.nan, np.nan
-    perm_stats = np.zeros(n_perm, dtype=float)
-    for i in range(n_perm):
-        shuffled = pc_meta_df.copy()
-        shuffled[predictor] = rng.permutation(shuffled[predictor].to_numpy())
-        perm_stats[i] = _weighted_r2(shuffled, predictor, evr, pc_cols=pc_cols)
-    p = (np.sum(perm_stats >= obs_stat) + 1) / (n_perm + 1)
-    return obs_stat, p
-
-
-def pseudobulk_by_label(adata, groupby='pool_participant', label='Celltypist:IBDverse_eqtl:predicted_labels', 
-                        min_cells=5, min_samples=30, layer='log1p_cp10k', method='mean', min_samples_per_gene=0.0, nhvgs=None):
-    """
-    Pseudobulk expression by label (cell type) and sample.
-    
-    For each cell type (label), aggregate expression across cells from the same sample (groupby),
-    then filter for cell types with sufficient samples.
-    
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data object
-    groupby : str
-        Column in adata.obs to group by (e.g., sample ID)
-    label : str
-        Column in adata.obs containing cell type labels
-    min_cells : int
-        Minimum number of cells required per groupby-label combination
-    min_samples : int
-        Minimum number of samples required per label to be included in output
-    layer : str
-        Layer to use for expression data
-    method : str
-        Aggregation method ('mean' or 'sum')
-    min_samples_per_gene : float
-        Minimum proportion of samples (0-1) in which a gene must be expressed (>0) to be retained.
-        If 0.0, no filtering is applied.
-    nhvgs : int, float, or None
-        Number of highly variable genes to select based on variance.
-        If int: select top N genes by variance
-        If float (0-1): select top proportion of genes (e.g., 0.2 for top 20%)
-        If None: no HVG filtering is applied
-        Applied after min_samples_per_gene filtering.
-        
-    Returns
-    -------
-    dict
-        Dictionary where keys are label values and values are DataFrames
-        with genes as columns and samples (groupby values) as rows.
-        Only includes labels with at least min_samples samples.
-        Genes are filtered to those expressed in at least min_samples_per_gene proportion of samples.
-    """
-    import pandas as pd
-    import numpy as np
-    
-    # Get expression matrix from specified layer
-    if layer in adata.layers:
-        print(f"..Using layer '{layer}' for expression data")
-        expr = adata.layers[layer]
-    else:
-        raise ValueError(f"Layer '{layer}' not found in adata.layers")
-    
-    # Convert to dense if sparse
-    if hasattr(expr, 'toarray'):
-        expr = expr.toarray()
-    
-    # Get metadata
-    obs = adata.obs.copy()
-    obs['_cell_idx'] = np.arange(len(obs))
-    
-    # Get unique labels
-    labels = obs[label].dropna().unique()
-    
-    pseudobulk_dict = {}
-    
-    for lab in labels:
-        print(f"....Processing label: {lab}")
-        # Subset to cells with this label
-        mask = obs[label] == lab
-        obs_sub = obs[mask].copy()
-        expr_sub = expr[mask, :]
-        
-        # Count cells per sample
-        cell_counts = obs_sub.groupby(groupby).size()
-        
-        # Filter samples with enough cells
-        valid_samples = cell_counts[cell_counts >= min_cells].index
-        
-        if len(valid_samples) < min_samples:
-            continue
-        
-        # Filter to valid samples
-        obs_sub = obs_sub[obs_sub[groupby].isin(valid_samples)]
-        expr_sub = expr[obs_sub['_cell_idx'].values, :]
-        
-        # Pseudobulk: aggregate by sample
-        sample_ids = obs_sub[groupby].values
-        unique_samples = np.unique(sample_ids)
-        
-        pseudobulk_expr = np.zeros((len(unique_samples), expr_sub.shape[1]))
-        
-        for i, samp in enumerate(unique_samples):
-            samp_mask = sample_ids == samp
-            if method == 'mean':
-                pseudobulk_expr[i, :] = expr_sub[samp_mask, :].mean(axis=0)
-            elif method == 'sum':
-                pseudobulk_expr[i, :] = expr_sub[samp_mask, :].sum(axis=0)
-            else:
-                raise ValueError(f"Unknown method: {method}")
-        
-        # Create DataFrame
-        pseudobulk_df = pd.DataFrame(
-            pseudobulk_expr,
-            index=unique_samples,
-            columns=adata.var_names
-        )
-        
-        # Filter genes by minimum proportion of samples
-        if min_samples_per_gene > 0:
-            # Count samples where gene expression > 0
-            n_samples = len(unique_samples)
-            min_sample_count = int(np.ceil(min_samples_per_gene * n_samples))
-            genes_expressed = (pseudobulk_df > 0).sum(axis=0) >= min_sample_count
-            pseudobulk_df = pseudobulk_df.loc[:, genes_expressed]
-            n_genes_kept = genes_expressed.sum()
-            n_genes_total = len(genes_expressed)
-            print(f"......Kept {n_genes_kept}/{n_genes_total} genes expressed in >={min_samples_per_gene:.1%} of samples")
-        
-        # Filter for highly variable genes by variance
-        if nhvgs is not None:
-            n_genes_before_hvg = pseudobulk_df.shape[1]
-            gene_vars = pseudobulk_df.var(axis=0)
-            
-            if isinstance(nhvgs, float) and 0 < nhvgs < 1:
-                # Select top proportion of genes
-                n_to_select = int(np.ceil(nhvgs * len(gene_vars)))
-            elif isinstance(nhvgs, int) and nhvgs > 0:
-                # Select top N genes
-                n_to_select = min(nhvgs, len(gene_vars))
-            else:
-                raise ValueError(f"nhvgs must be a positive int or float between 0 and 1, got {nhvgs}")
-            
-            # Get top N genes by variance
-            top_var_genes = gene_vars.nlargest(n_to_select).index
-            pseudobulk_df = pseudobulk_df[top_var_genes]
-            print(f"......Selected {n_to_select}/{n_genes_before_hvg} highly variable genes by variance")
-        
-        pseudobulk_dict[lab] = pseudobulk_df
-    
-    return pseudobulk_dict
-
-def pca_on_expression(expr_df, scale=True):
-    """
-    Perform PCA on expression matrix (samples x genes).
-    
-    Parameters
-    ----------
-    expr_df : DataFrame
-        Expression matrix with samples as rows and genes as columns
-    scale : bool
-        Whether to scale features (genes) to unit variance
-        
-    Returns
-    -------
-    tuple
-        (pc_scores DataFrame, explained_variance_ratio array)
-    """
-    X = expr_df.to_numpy()
-    
-    # Center the data
-    X_centered = X - X.mean(axis=0, keepdims=True)
-    
-    # Scale if requested
-    if scale:
-        std = X.std(axis=0, keepdims=True)
-        std[std == 0] = 1  # avoid division by zero
-        X_centered = X_centered / std
-    
-    # SVD
-    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-    scores = U * S
-    explained_variance = (S ** 2) / (X.shape[0] - 1)
-    explained_variance_ratio = explained_variance / explained_variance.sum()
-    
-    # Create PC scores DataFrame
-    n_pcs = scores.shape[1]
-    pcs = [f'PC{i+1}' for i in range(n_pcs)]
-    pc_scores = pd.DataFrame(scores, index=expr_df.index, columns=pcs).reset_index()
-    
-    return pc_scores, explained_variance_ratio
+from matplotlib.colors import LinearSegmentedColormap
+from plotnine import (
+    ggplot, aes, geom_tile, geom_text, scale_fill_gradient,
+    theme, theme_bw, element_text, element_blank, labs
+)
+import sys
+import os
+sys.path.append("bin")
+from qc_check_helpers import (
+    load_and_format_obs,
+    build_ca, _is_categorical, _r2_for_predictor, _weighted_r2,
+    permutation_pvalue, _sig_stars, pseudobulk_by_label, pca_on_expression,
+    pca_variance_explained, variance_explained_by_covariates,
+)
 
 ####################
 # Options
@@ -295,6 +43,12 @@ h5ad_full="results_round1/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/ob
 outdir="results_round1/IBDRbatch1-8-conf_gt0pt5-immune-baseline-nobadsamps/figures/check_QC"
 nonmerged_wetlab_meta="/lustre/scratch125/humgen/projects_v2/ibdresponse/analysis/bradley_analysis/IBDR_prep/processed_data/wetlab_metadata/2026-01-26-WETLAB-IBD-R_Sample_Record.csv"
 repo_dir = "/lustre/scratch127/humgen/projects_v2/sc-eqtl-ibd/analysis/bradley_analysis/IBDverse/IBDVerse-sc-eQTL-code/"
+qc_metrics = ['n_genes_by_counts', 'total_counts', 'pct_counts_gene_group__mito_transcript', 'num_cells_in_sample', 'Myeloid', 'T']
+plot_distributions = False   # QC metric plots, pool-size and transit-time histograms
+plot_abundance = True        # Pairwise CLR vs predictor scatter plots and volcano
+use_omega2 = True            # True → ω²/adj-R² (penalises for #levels); False → η²/R² (uncorrected)
+effect_size_label = 'Weighted ω²' if use_omega2 else 'Weighted η² / R²'
+effect_size_col = 'weighted_omega2' if use_omega2 else 'weighted_r2'
 palette = pd.read_csv(f"{repo_dir}/data/palette.csv")
 color_map = dict(zip(palette['category'], palette['category_color']))
 annot_mapping = pd.read_csv(f"{repo_dir}/data/all_IBDverse_annotation_mastersheet.csv")
@@ -340,208 +94,141 @@ annot_mapping['label_machine'] = annot_mapping['label_machine'].astype(str) + '_
 annot_mapping['tissue'] = annot_mapping['tissue'].map(tissue_mapping)
 annot_mapping['annotation_type'] = annot_mapping['Level'].map({0: 'All Cells', 1: 'Major population', 2: 'Cell type'})
 
+meta_cols = [
+    'convoluted_samplename',
+    'collection_to_wetlab',
+    'shipment_to_wetlab',
+    'num_samples_in_pool',
+    'site'
+] + ["meta-" + x for x in [
+    "Age", "BMI", "Months_since_Dx", "Months_since_Symptoms",
+    "Baseline_PRO2_CD", "Baseline_PRO2_UC", "Calprotectin",
+    "Bristol", "CRP", "Number_previous_biologic", "W14_RESPONSE", "W14_REMISSION", "Sex", "Diagnosis",
+    "Restricted_diet", "Smoking", "Montreal_location",
+    "Montreal_behaviour", "Montreal_extent", "Max_extent",
+    "Baseline_Previous_immunomodulator", "Baseline_Mesalazine",
+    "Previous_biologic", "Biologic_stopping", "Steroids",
+    "CD_Surgery", "Appendectomy"
+]]
+
 ####################
-# Import the .obs from the post-QC h5ad
-f2 = File(h5ad, 'r')
-obs = read_elem(f2['obs'])
+# Output directories
+####################
+abundance_dir  = os.path.join(outdir, 'abundance')
+pairwise_dir   = os.path.join(abundance_dir, 'pairwise')
+expression_dir = os.path.join(outdir, 'expression')
+for _d in [outdir, abundance_dir, pairwise_dir, expression_dir]:
+    os.makedirs(_d, exist_ok=True)
+
+####################
+# Load and format metadata
+####################
+obs, poolcount, test_collection_to_wetlab = load_and_format_obs(h5ad, nonmerged_wetlab_meta, qc_metrics)
+meta_df = obs[['pool_participant'] + meta_cols].drop_duplicates()
 
 ##################
-# Add some derived covariates to .obs
+# Overall distributions
 ##################
-# Annotate .obs with the number of samples in each pool (make sure this comes from the wetlab metadata, not the .obs itself, as this is filtered for perfect matches)
-wetlab_meta = pd.read_csv(nonmerged_wetlab_meta)
-wetlab_meta = wetlab_meta[~(wetlab_meta['Sequencing_ID'] == "Not_sequenced")]
-wetlab_meta = wetlab_meta[~(wetlab_meta['Sequencing_ID'].isna())]
-wetlab_meta['pool_participant'] = wetlab_meta['Sequencing_ID'].astype(str) + "_" + wetlab_meta['Participant_Study_ID'].astype(str)
-wetlab_meta = wetlab_meta.rename(columns={'Sequencing_ID': 'convoluted_samplename'})
-poolcount = pd.DataFrame(wetlab_meta[['convoluted_samplename', 'pool_participant']].groupby('convoluted_samplename').nunique()).reset_index()
-poolcount.columns = ['convoluted_samplename', 'num_samples_in_pool']
-obs = obs.merge(poolcount, on='convoluted_samplename', how='left')
-
-plt.figure(figsize=(8,6))
-sns.histplot(poolcount['num_samples_in_pool'].dropna(), bins=40, kde=False)
-plt.title(f'Distribution of Num Samples In Pool')
-plt.xlabel('Number of Samples')
-plt.ylabel('Count')
-plt.savefig(f'{outdir}/num_samples_in_pool_hist.png')
-plt.close()
-
-# Also add the number of cells per sample (and median per pool)
-cellcount = pd.DataFrame(obs[['convoluted_samplename', 'pool_participant']].groupby('pool_participant').size()).reset_index()
-cellcount.columns = ['pool_participant', 'num_cells_in_sample']
-obs = obs.merge(cellcount, on='pool_participant', how='left')
-
-# Also add the proportion of each category per sample
-celltype_counts = pd.DataFrame(obs[['pool_participant', 'IBDverse_eqtl:Category']].groupby(['pool_participant', 'IBDverse_eqtl:Category']).size()).reset_index()
-celltype_counts.columns = ['pool_participant', 'IBDverse_eqtl:Category', 'count']
-total_counts = pd.DataFrame(obs[['pool_participant']].groupby('pool_participant').size()).reset_index()
-total_counts.columns = ['pool_participant', 'total_count']
-celltype_counts = celltype_counts.merge(total_counts, on='pool_participant', how='left')
-celltype_counts['proportion'] = celltype_counts['count'] / celltype_counts['total_count']
-celltype_counts_add = celltype_counts[['pool_participant', 'IBDverse_eqtl:Category', 'proportion']].pivot(index='pool_participant', columns='IBDverse_eqtl:Category', values='proportion').reset_index()
-obs = obs.merge(celltype_counts_add, on='pool_participant', how='left')
-
-
-# Manually correct some errors
-obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'].astype('string')
-mask = (obs['convoluted_samplename'] == "IBD-RESPONSE13764153") & (obs['participant_id'] == "CAM0046") # Typo of the month, updated in newest version of the metadata
-obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2023-04-13"
-mask = (obs['convoluted_samplename'] == "IBD-RESPONSE14552622") & (obs['participant_id'] == "OXF0006") # Typo of the month, updated in newest version of the metadata
-obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2023-11-08"
-mask = (obs['convoluted_samplename'] == "IBD-RESPONSE15443671")  # Typo of the days, so was received before collected
-obs.loc[mask, 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] = "2025-01-16"
-
-# Normalize and parse mixed date formats (YYYY-MM-DD and DD-MM-YYYY)
-date_cols = ['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.', 'meta-Date_of_shipment', 'meta-Sample_Collection']
-for col in date_cols:
-    obs[col] = (
-        obs[col]
-        .astype('string')
-        .str.strip()
-        .str.replace('/', '-', regex=False)
-        .str.replace(' ', '', regex=False)
-    )
-    parsed_ymd = pd.to_datetime(obs[col], format="%Y-%m-%d", errors='coerce')
-    parsed_dmy = pd.to_datetime(obs[col], format="%d-%m-%Y", errors='coerce')
-    obs[col] = parsed_ymd.fillna(parsed_dmy)
-
-# And the time between dispatch and delivery (in days)
-for col in date_cols:
-    obs[col] = pd.to_datetime(obs[col].astype('string'), errors='coerce')
-
-# Extract the info per sample to plot
-obs['collection_to_wetlab'] = (obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] - obs['meta-Sample_Collection']).dt.days
-obs['shipment_to_wetlab'] = (obs['meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.'] - obs['meta-Date_of_shipment']).dt.days
-test_collection_to_wetlab = obs[['convoluted_samplename', 'participant_id', 'meta-Date_of_shipment', 'meta-date_blood_sent_sanger', 'meta-Sample_Collection', 'meta-blood_date_collected', 'meta-Sender', 'meta-Date_of_receipt_at_Laboratory_.yyyy.mm.dd.', 'collection_to_wetlab', 'shipment_to_wetlab']].drop_duplicates().reset_index(drop=True)
-
-# Distribution of collection_to_wetlab (days)
-plotcols = ['shipment_to_wetlab', 'collection_to_wetlab']
-os.makedirs(outdir, exist_ok=True)
-for c in plotcols:
-    plt.figure(figsize=(8,6))
-    sns.histplot(test_collection_to_wetlab[c].dropna(), bins=40, kde=False)
-    plt.title(f'Distribution of {c.replace("_", " ").title()} (days)')
-    plt.xlabel('Days')
-    plt.ylabel('Count')
-    plt.savefig(f'{outdir}/{c}_days_hist.png')
-    plt.close()
-
-# Recalculate QC metrics PER POOL, not sample
-qc_metrics = ['n_genes_by_counts', 'total_counts', 'pct_counts_gene_group__mito_transcript', 'num_cells_in_sample', 'Myeloid', 'T']
-for metric in qc_metrics:
-    if metric + '-pool_median' not in obs.columns:
-        print(f"... calculating {metric} pool median")
-        temp = obs[[metric, 'convoluted_samplename']].groupby('convoluted_samplename').median().reset_index()
-        temp.columns = ['convoluted_samplename', metric + '-pool_median']
-        obs = obs.merge(temp, on='convoluted_samplename', how='left')
-
-##################
-# Plot
-##################
-# Plot QC metrices per sample, dividing samples by the number of samples in each pool
 obs['num_samples_in_pool'] = obs['num_samples_in_pool'].astype(str)
 pool_numbers = np.sort(np.unique(obs['num_samples_in_pool']))
-for metric in qc_metrics:
-    # Plot distributions
-    plt.figure(figsize=(8,6))
-    for pool_num in pool_numbers:
-        subset = obs[obs['num_samples_in_pool'] == pool_num]
-        sns.kdeplot(subset[metric], label=f'Pool Size: {pool_num}', fill=True, alpha=0.5)
-    plt.legend()
-    plt.title(f'{metric} by Number of Samples in Pool')
-    plt.xlabel(metric)
-    plt.ylabel('Density')
-    plt.savefig(f'{outdir}/qc_{metric}_dist.png')
-    plt.close() 
-    # Boxplots
-    plt.figure(figsize=(8,6))
-    sns.boxplot(x='num_samples_in_pool', y=metric, data=obs)
-    plt.title(f'{metric} by Number of Samples in Pool')
-    plt.xlabel('Number of Samples in Pool')
-    plt.ylabel(metric)
-    plt.savefig(f'{outdir}/qc_{metric}_boxplot.png')
+
+if plot_distributions:
+    os.makedirs(outdir, exist_ok=True)
+    # Pool size histogram
+    plt.figure(figsize=(8, 6))
+    sns.histplot(poolcount['num_samples_in_pool'].dropna(), bins=40, kde=False)
+    plt.title('Distribution of Num Samples In Pool')
+    plt.xlabel('Number of Samples')
+    plt.ylabel('Count')
+    plt.savefig(f'{outdir}/num_samples_in_pool_hist.png')
+    plt.close()
+    # Transit-time histograms
+    for c in ['shipment_to_wetlab', 'collection_to_wetlab', 'site']:
+        plt.figure(figsize=(8, 6))
+        sns.histplot(meta_df[c].dropna(), bins=40, kde=False)
+        plt.title(f'Distribution of {c.replace("_", " ").title()} (days)')
+        plt.xlabel('Days')
+        plt.ylabel('Count')
+        if c == 'site':
+            plt.setp(plt.gca().get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+        plt.tight_layout()
+        plt.savefig(f'{outdir}/{c}_days_hist.png')
+        plt.close()
+    # QC metrics by pool size
+    for metric in qc_metrics:
+        plt.figure(figsize=(8, 6))
+        for pool_num in pool_numbers:
+            subset = obs[obs['num_samples_in_pool'] == pool_num]
+            sns.kdeplot(subset[metric], label=f'Pool Size: {pool_num}', fill=True, alpha=0.5)
+        plt.legend()
+        plt.title(f'{metric} by Number of Samples in Pool')
+        plt.xlabel(metric)
+        plt.ylabel('Density')
+        plt.savefig(f'{outdir}/qc_{metric}_dist.png')
+        plt.close()
+        plt.figure(figsize=(8, 6))
+        sns.boxplot(x='num_samples_in_pool', y=metric, data=obs)
+        plt.title(f'{metric} by Number of Samples in Pool')
+        plt.xlabel('Number of Samples in Pool')
+        plt.ylabel(metric)
+        plt.savefig(f'{outdir}/qc_{metric}_boxplot.png')
+        plt.close()
+    # Scatter: collection to wetlab vs pool size
+    spec_comp = obs[['pool_participant', 'num_samples_in_pool', 'collection_to_wetlab']].drop_duplicates()
+    plt.figure(figsize=(8, 6))
+    valid = spec_comp[['collection_to_wetlab', 'num_samples_in_pool']].dropna()
+    sns.histplot(data=valid, x='collection_to_wetlab', y='num_samples_in_pool', bins=30, cmap='viridis', cbar=True)
+    mask = np.isfinite(spec_comp['collection_to_wetlab']) & np.isfinite(spec_comp['num_samples_in_pool'])
+    if mask.sum() >= 3:
+        x = spec_comp.loc[mask, 'collection_to_wetlab'].astype(float).values
+        y = spec_comp.loc[mask, 'num_samples_in_pool'].astype(float).values
+        slope, intercept = np.polyfit(x, y, 1)
+        x_line = np.linspace(np.min(x), np.max(x), 100)
+        y_line = slope * x_line + intercept
+        plt.plot(x_line, y_line, color='red', linestyle='--', linewidth=1.5)
+        rho, pval = stats.pearsonr(x, y)
+        plt.text(0.02, 0.98, f'r={rho:.3f}, p={pval:.3e}', transform=plt.gca().transAxes,
+                 ha='left', va='top', fontsize=15)
+    plt.xlabel('collection_to_wetlab')
+    plt.ylabel('num_samples_in_pool')
+    plt.tight_layout()
+    plt.savefig(f'{outdir}/scatter_collection_to_wetlab_vs_num_samples_in_pool.png')
     plt.close()
     
-    
-# Compare the per-sample number of samples in pool with the collection to wetlab
-spec_comp = obs[['pool_participant', 'num_samples_in_pool', 'collection_to_wetlab']].drop_duplicates()
-plt.figure(figsize=(8,6))
-valid = spec_comp[['collection_to_wetlab', 'num_samples_in_pool']].dropna()
-sns.histplot(
-    data=valid,
-    x='collection_to_wetlab',
-    y='num_samples_in_pool',
-    bins=30,
-    cmap='viridis',
-    cbar=True
-)
-mask = np.isfinite(spec_comp['collection_to_wetlab']) & np.isfinite(spec_comp['num_samples_in_pool'])
-if mask.sum() >= 3:
-    x = spec_comp.loc[mask, 'collection_to_wetlab'].astype(float).values
-    y = spec_comp.loc[mask, 'num_samples_in_pool'].astype(float).values
-    slope, intercept = np.polyfit(x, y, 1)
-    x_line = np.linspace(np.min(x), np.max(x), 100)
-    y_line = slope * x_line + intercept
-    plt.plot(x_line, y_line, color='red', linestyle='--', linewidth=1.5)
-    rho, pval = stats.pearsonr(x, y)
-    plt.text(0.02, 0.98, f'r={rho:.3f}, p={pval:.3e}', transform=plt.gca().transAxes,
-             ha='left', va='top', fontsize=15)
-
-plt.xlabel('collection_to_wetlab')
-plt.ylabel('num_samples_in_pool')
-plt.tight_layout()
-plt.savefig(f'{outdir}/scatter_collection_to_wetlab_vs_num_samples_in_pool.png')
-plt.close()
-    
 ##################
-# Look more strictly at cell-type abundances
-# Is the abundance of any cell-type associated with pool size, or the time taken to arrive at the wetlab?
+# Cell-type abundance vs technical factors
 ##################
 labels = ['Celltypist:IBDverse_eqtl:predicted_labels', 'IBDverse_eqtl:Category']
 
-# Containers to collect per-label regression DataFrames for programmatic use
 ca_dict_pool = {}
 ca_dict_sample = {}
 results_list = []
 results_dict = {}
 
 for label in labels:
-    celltypes = obs[label].unique()
     obs[['num_samples_in_pool']] = obs[['num_samples_in_pool']].astype(int)
-    # Pool-level (convoluted_samplename)
-    ca_pool = build_ca(obs, label = label, group_col='convoluted_samplename')
+    ca_pool = build_ca(obs, label=label, group_col='convoluted_samplename')
     num_samples = obs[['convoluted_samplename', 'num_samples_in_pool']].drop_duplicates()
     ca_pool = ca_pool.merge(num_samples, on='convoluted_samplename', how='left')
     coll_to_wetlab_pool = obs[['convoluted_samplename', 'collection_to_wetlab', 'shipment_to_wetlab']].groupby('convoluted_samplename').median().reset_index()
     ca_pool = ca_pool.merge(coll_to_wetlab_pool, on='convoluted_samplename', how='left')
-    ca_pool['num_samples_in_pool'] = ca_pool['num_samples_in_pool'].astype(float)
-    ca_pool['collection_to_wetlab'] = ca_pool['collection_to_wetlab'].astype(float)
-    ca_pool['shipment_to_wetlab'] = ca_pool['shipment_to_wetlab'].astype(float)
+    ca_pool[['num_samples_in_pool', 'collection_to_wetlab', 'shipment_to_wetlab']] = ca_pool[['num_samples_in_pool', 'collection_to_wetlab', 'shipment_to_wetlab']].astype(float)
     ca_dict_pool[label] = ca_pool
-    # Sample-level (pool_participant)
-    ca_sample = build_ca(obs, label = label, group_col='pool_participant')
+    ca_sample = build_ca(obs, label=label, group_col='pool_participant')
     sample_meta = obs[['pool_participant', 'collection_to_wetlab', 'shipment_to_wetlab']].groupby('pool_participant').median().reset_index()
     ca_sample = ca_sample.merge(sample_meta, on='pool_participant', how='left')
-    ca_sample['collection_to_wetlab'] = ca_sample['collection_to_wetlab'].astype(float)
-    ca_sample['shipment_to_wetlab'] = ca_sample['shipment_to_wetlab'].astype(float)
+    ca_sample[['collection_to_wetlab', 'shipment_to_wetlab']] = ca_sample[['collection_to_wetlab', 'shipment_to_wetlab']].astype(float)
     ca_dict_sample[label] = ca_sample
-    # Run linear regression of CLR ~ num_samples_in_pool / collection_to_wetlab / shipment_to_wetlab for each cell-type label
-    os.makedirs(outdir, exist_ok=True)
     results = []
-    celltypelabels = obs[label].unique()
-    for celltypelabel in celltypelabels:
+    for celltypelabel in obs[label].unique():
         for predictor in ['num_samples_in_pool', 'collection_to_wetlab', 'shipment_to_wetlab']:
             ca_use = ca_pool if predictor == 'num_samples_in_pool' else ca_sample
             subset = ca_use[ca_use[label] == celltypelabel]
-            # Filter NA
             subset = subset[subset['proportion_clr'].notna() & subset[predictor].notna()]
-            # Filter groups with < 3 observation
-            obs_per_group = subset[predictor].value_counts()
-            valid_groups = obs_per_group[obs_per_group >= 3].index
-            subset = subset[subset[predictor].isin(valid_groups)]
+            valid_groups = subset[predictor].value_counts()
+            subset = subset[subset[predictor].isin(valid_groups[valid_groups >= 3].index)]
             y = subset['proportion_clr'].values.astype(float)
             x = subset[predictor].values.astype(float)
-            # require at least 3 observations with finite values
             finite_mask = np.isfinite(x) & np.isfinite(y)
             if finite_mask.sum() < 3:
                 results.append({'celltypelabel': celltypelabel, 'predictor': predictor, 'n': int(finite_mask.sum()), 'slope': np.nan, 'intercept': np.nan, 'r_value': np.nan, 'p_value': np.nan, 'std_err': np.nan})
@@ -549,17 +236,14 @@ for label in labels:
             try:
                 lr = stats.linregress(x[finite_mask], y[finite_mask])
                 results.append({'celltypelabel': celltypelabel, 'predictor': predictor, 'n': int(finite_mask.sum()), 'slope': lr.slope, 'intercept': lr.intercept, 'r_value': lr.rvalue, 'p_value': lr.pvalue, 'std_err': lr.stderr})
-            except Exception as e:
+            except Exception:
                 results.append({'celltypelabel': celltypelabel, 'predictor': predictor, 'n': int(finite_mask.sum()), 'slope': np.nan, 'intercept': np.nan, 'r_value': np.nan, 'p_value': np.nan, 'std_err': np.nan})
     results_df = pd.DataFrame(results).sort_values('p_value')
-    # Benjamini-Hochberg FDR correction for the p-values (adds `p_value_adj`)
     pvals = results_df['p_value'].to_numpy()
     mask = np.isfinite(pvals)
-    # default filler for non-finite p-values
     adj = np.full(pvals.shape, np.nan)
     if mask.sum() > 0:
         p_for_adj = pvals[mask]
-        # BH procedure
         order = np.argsort(p_for_adj)
         ranks = np.empty_like(order)
         ranks[order] = np.arange(1, len(p_for_adj) + 1)
@@ -568,108 +252,93 @@ for label in labels:
         q[q > 1] = 1.0
         adj[mask] = q
     results_df['p_value_adj'] = adj
-    results_df.to_csv(f'{outdir}/{label}_clr_vs_technical_factors_regression_results.csv', index=False)
-    # collect into list/dict while keeping CSVs
+    results_df.to_csv(f'{abundance_dir}/{label}_clr_vs_technical_factors_regression_results.csv', index=False)
     results_list.append(results_df)
     results_dict[label] = results_df
 
-
-# Plot the significant cell types
-for label in labels:
-    results_df = results_dict[label]
-    sig_results = results_df[results_df['p_value'] < 0.05]
-    for _, row in sig_results.iterrows():
-        celltypelabel = row['celltypelabel']
-        predictor = row['predictor']
-        ca_df = ca_dict_pool[label] if predictor == 'num_samples_in_pool' else ca_dict_sample[label]
-        subset = ca_df[ca_df[label] == celltypelabel]
-        # Filter NA
-        subset = subset[subset['proportion_clr'].notna() & subset[predictor].notna()]
-        # Filter groups with < 3 observation
-        obs_per_group = subset[predictor].value_counts()
-        valid_groups = obs_per_group[obs_per_group >= 3].index
-        subset = subset[subset[predictor].isin(valid_groups)]
-        # skip empty subsets
-        if subset.shape[0] == 0:
-            continue
-        plt.figure(figsize=(8,6))
-        # prepare category order (string) so violin/strip align
-        uniq = sorted(subset[predictor].dropna().unique())
-        order = [str(x) for x in uniq]
-        # violin plot (no inner points)
-        sns.violinplot(x=subset[predictor].astype(str), y='proportion_clr', data=subset, order=order, inner=None, color='lightgray')
-        # jittered points on top
-        sns.stripplot(x=subset[predictor].astype(str), y='proportion_clr', data=subset, order=order, jitter=0.25, size=4, color='black', alpha=0.6)
-        # Plot regression line mapped to category positions
-        x_pos = np.arange(len(uniq))
-        y_pred = [row['intercept'] + row['slope'] * v for v in uniq]
-        plt.plot(x_pos, y_pred, '--', color='red')
-        # Add median and IQR as horizontal lines per pool size
-        ax = plt.gca()
-        for i, pool_size in enumerate(uniq):
-            pool_data = subset[subset[predictor] == pool_size]['proportion_clr']
-            med = pool_data.median()
-            q25 = pool_data.quantile(0.25)
-            q75 = pool_data.quantile(0.75)
-            # Draw median as solid line
-            ax.hlines(med, i - 0.4, i + 0.4, colors='blue', linewidth=2, linestyle='-', label='Median' if i == 0 else '')
-            # Draw IQR bounds as dashed lines
-            ax.hlines(q25, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--', label='IQR' if i == 0 else '')
-            ax.hlines(q75, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--')
-        plt.xlabel(predictor.replace("_", " "))
-        plt.title(f'CLR of {celltypelabel} vs {predictor.replace("_", " ")} ({label})\n p={row["p_value"]:.3e}, slope={row["slope"]:.3f}')
-        plt.ylabel('CLR Proportion')
-        celltypelabel = str(celltypelabel).replace('/', '.')
-        plt.savefig(f'{outdir}/{label}_{celltypelabel}_clr_vs_{predictor}.png')
-        plt.close() 
-
-# Manually inspect results
 results_all = pd.concat(results_list, ignore_index=True)
-results_all[results_all['p_value_adj'] < 0.05].sort_values('p_value').shape[0] # 20
-results_all[results_all['p_value_adj'] < 0.05].sort_values('p_value').to_csv(f'{outdir}/significant_celltype_abundance_vs_technical_factors_univariate.csv', index=False)
+results_all[results_all['p_value_adj'] < 0.05].sort_values('p_value').to_csv(
+    f'{abundance_dir}/significant_celltype_abundance_vs_technical_factors_univariate.csv', index=False)
+results_all = results_all.merge(
+    annot_mapping[['label_new', 'category', 'annotation_type']].drop_duplicates(),
+    left_on="celltypelabel", right_on="label_new", how='left')
 
-# Plot a volcano of these results
-results_all = results_all.merge(annot_mapping[['label_new', 'category', 'annotation_type']].drop_duplicates(), left_on="celltypelabel", right_on="label_new", how='left')
-
-for predictor in results_all['predictor'].dropna().unique():
-    sub = results_all[results_all['predictor'] == predictor].copy()
-    sub = sub[np.isfinite(sub['slope']) & np.isfinite(sub['p_value'])]
-    if sub.shape[0] == 0:
-        continue
-    sub['point_color'] = np.where(
-        sub['p_value_adj'] < 0.05,
-        sub['category'].map(color_map).fillna('#9e9e9e'),
-        '#9e9e9e'
-    )
+if plot_abundance:
+    # Pairwise scatter plots for significant cell types
+    for label in labels:
+        results_df = results_dict[label]
+        sig_results = results_df[results_df['p_value'] < 0.05]
+        for _, row in sig_results.iterrows():
+            celltypelabel = row['celltypelabel']
+            predictor = row['predictor']
+            ca_df = ca_dict_pool[label] if predictor == 'num_samples_in_pool' else ca_dict_sample[label]
+            subset = ca_df[ca_df[label] == celltypelabel]
+            subset = subset[subset['proportion_clr'].notna() & subset[predictor].notna()]
+            valid_groups = subset[predictor].value_counts()
+            subset = subset[subset[predictor].isin(valid_groups[valid_groups >= 3].index)]
+            if subset.shape[0] == 0:
+                continue
+            plt.figure(figsize=(8, 6))
+            uniq = sorted(subset[predictor].dropna().unique())
+            order = [str(x) for x in uniq]
+            sns.violinplot(x=subset[predictor].astype(str), y='proportion_clr', data=subset, order=order, inner=None, color='lightgray')
+            sns.stripplot(x=subset[predictor].astype(str), y='proportion_clr', data=subset, order=order, jitter=0.25, size=4, color='black', alpha=0.6)
+            x_pos = np.arange(len(uniq))
+            y_pred = [row['intercept'] + row['slope'] * v for v in uniq]
+            plt.plot(x_pos, y_pred, '--', color='red')
+            ax = plt.gca()
+            for i, pool_size in enumerate(uniq):
+                pool_data = subset[subset[predictor] == pool_size]['proportion_clr']
+                med = pool_data.median()
+                q25 = pool_data.quantile(0.25)
+                q75 = pool_data.quantile(0.75)
+                ax.hlines(med, i - 0.4, i + 0.4, colors='blue', linewidth=2, linestyle='-', label='Median' if i == 0 else '')
+                ax.hlines(q25, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--', label='IQR' if i == 0 else '')
+                ax.hlines(q75, i - 0.4, i + 0.4, colors='green', linewidth=1.5, linestyle='--')
+            plt.xlabel(predictor.replace("_", " "))
+            plt.title(f'CLR of {celltypelabel} vs {predictor.replace("_", " ")} ({label})\n p={row["p_value"]:.3e}, slope={row["slope"]:.3f}')
+            plt.ylabel('CLR Proportion')
+            safe_ct = str(celltypelabel).replace('/', '.')
+            plt.savefig(f'{pairwise_dir}/{label}_{safe_ct}_clr_vs_{predictor}.png')
+            plt.close()
+    
+    # Volcano plots
     size_map = {'Cell type': 100, 'Major population': 200, 'All Cells': 400}
-    sub['point_size'] = sub['annotation_type'].map(size_map).fillna(25)
-    sub['neglog10_p'] = -np.log10(sub['p_value'])
-    plt.figure(figsize=(8, 6))
-    plt.scatter(sub['slope'], sub['neglog10_p'], c=sub['point_color'], s=sub['point_size'], alpha=0.8)
-    # Label significant points
-    sig = sub[sub['p_value_adj'] < 0.05]
-    for _, row in sig.iterrows():
-        plt.text(row['slope'], row['neglog10_p'], str(row['celltypelabel']), fontsize=7, alpha=0.9)
-    plt.xlabel('Slope')
-    plt.ylabel('-log10(p-value)')
-    plt.title(str(predictor))
-    # Build legends for color (categories) and size (annotation_type)
-    from matplotlib.lines import Line2D
-    sig_cats = sub.loc[sub['p_value_adj'] < 0.05, 'category'].dropna().unique().tolist()
-    color_handles = [Line2D([0], [0], marker='o', color='w', label=cat,
-                markerfacecolor=color_map.get(cat, '#9e9e9e'), markersize=8)
-            for cat in sig_cats]
-    color_handles.append(Line2D([0], [0], marker='o', color='w', label='Not significant',
-                    markerfacecolor='#9e9e9e', markersize=8))
-    size_handles = [Line2D([0], [0], marker='o', color='w', label=lbl,
-                    markerfacecolor='#666666', markersize=np.sqrt(sz))
-                for lbl, sz in size_map.items()]
-    first_legend = plt.legend(handles=color_handles, title='Major pop. (p_adj<0.05)', loc='upper right', frameon=True)
-    plt.gca().add_artist(first_legend)
-    plt.legend(handles=size_handles, title='Annotation type', loc='lower right', frameon=True)
-    plt.tight_layout()
-    plt.savefig(f"{outdir}/volcano_{predictor}.png")
-    plt.close()
+    for predictor in results_all['predictor'].dropna().unique():
+        sub = results_all[results_all['predictor'] == predictor].copy()
+        sub = sub[np.isfinite(sub['slope']) & np.isfinite(sub['p_value'])]
+        if sub.shape[0] == 0:
+            continue
+        sub['point_color'] = np.where(
+            sub['p_value_adj'] < 0.05,
+            sub['category'].map(color_map).fillna('#9e9e9e'),
+            '#9e9e9e'
+        )
+        sub['point_size'] = sub['annotation_type'].map(size_map).fillna(25)
+        sub['neglog10_p'] = -np.log10(sub['p_value'])
+        plt.figure(figsize=(8, 6))
+        plt.scatter(sub['slope'], sub['neglog10_p'], c=sub['point_color'], s=sub['point_size'], alpha=0.8)
+        sig = sub[sub['p_value_adj'] < 0.05]
+        for _, row in sig.iterrows():
+            plt.text(row['slope'], row['neglog10_p'], str(row['celltypelabel']), fontsize=7, alpha=0.9)
+        plt.xlabel('Slope')
+        plt.ylabel('-log10(p-value)')
+        plt.title(str(predictor))
+        sig_cats = sub.loc[sub['p_value_adj'] < 0.05, 'category'].dropna().unique().tolist()
+        color_handles = [Line2D([0], [0], marker='o', color='w', label=cat,
+                    markerfacecolor=color_map.get(cat, '#9e9e9e'), markersize=8)
+                for cat in sig_cats]
+        color_handles.append(Line2D([0], [0], marker='o', color='w', label='Not significant',
+                        markerfacecolor='#9e9e9e', markersize=8))
+        size_handles = [Line2D([0], [0], marker='o', color='w', label=lbl,
+                        markerfacecolor='#666666', markersize=np.sqrt(sz))
+                    for lbl, sz in size_map.items()]
+        first_legend = plt.legend(handles=color_handles, title='Major pop. (p_adj<0.05)', loc='upper right', frameon=True)
+        plt.gca().add_artist(first_legend)
+        plt.legend(handles=size_handles, title='Annotation type', loc='lower right', frameon=True)
+        plt.tight_layout()
+        plt.savefig(f'{abundance_dir}/volcano_{predictor}.png')
+        plt.close()
 
 ##################
 # Compute a PCA based on the cell-type proportions per sample, and compute the variance explained by each of the technical factors.
@@ -680,78 +349,29 @@ ca = build_ca(obs, label=label_for_pca, group_col=group_col)
 
 # Build wide CLR matrix for PCA
 clr_wide = ca.pivot_table(index=group_col, columns=label_for_pca, values='proportion_clr', aggfunc='mean', fill_value=0)
-X = clr_wide.to_numpy()
-X_centered = X - X.mean(axis=0, keepdims=True)
-U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-scores = U * S
-explained_variance = (S ** 2) / (X.shape[0] - 1)
-explained_variance_ratio = explained_variance / explained_variance.sum()
 
-pcs = [f'PC{i+1}' for i in range(scores.shape[1])]
-pc_scores = pd.DataFrame(scores, index=clr_wide.index, columns=pcs).reset_index()
+results_df, pc_scores, explained_variance_ratio, knee_idx = pca_variance_explained(
+    clr_wide, meta_df, meta_cols, group_col,
+    use_knee=True, scale=False, n_perm=1000, seed=1,
+)
 
-# Merge with metadata (per sample)
-meta_cols = [
-    'collection_to_wetlab',
-    'shipment_to_wetlab',
-    'num_samples_in_pool',
-    'meta-Sex',
-    'meta-BMI',
-    'meta-Months_since_Dx',
-    'meta-Months_since_Symptoms',
-    'meta-Restricted_diet',
-    'meta-Smoking',
-    'meta-Baseline_Previous_immunomodulator',
-    'meta-Baseline_Number_previous_immunomodulator',
-    'meta-Previous_biologic',
-    'meta-Biologic_starting',
-    'meta-Steroids',
-    'meta-Diagnosis'
-]
-meta_df = obs[[group_col] + meta_cols].drop_duplicates()
+results_df.to_csv(f'{abundance_dir}/cell_abundance_pca_variance_explained_by_technical_factors.csv', index=False)
+
 pc_meta = pc_scores.merge(meta_df, on=group_col, how='left')
 
-# Compute regression of PCs vs meta columns
-results = []
-n_perm = 1000
-for predictor in meta_cols:
-    print(f"... testing {predictor}")
-    obs_stat, p_val = permutation_pvalue(pc_meta, predictor, explained_variance_ratio, n_perm=n_perm, seed=1)
-    results.append({
-        'predictor': predictor,
-        'weighted_r2': obs_stat,
-        'p_value_perm': p_val,
-        'n_perm': n_perm
-    })
-
-results_df = pd.DataFrame(results).sort_values('p_value_perm')
-if results_df.shape[0] > 0:
-    m = results_df.shape[0]
-    results_df['p_value_perm_bonf'] = np.minimum(results_df['p_value_perm'] * m, 1.0)
-
-results_df.to_csv(f'{outdir}/cell_abundance_pca_variance_explained_by_technical_factors.csv', index=False)
-
-# Plot the skee plot for the PC factors
+# Plot the scree plot for the PC factors
 plt.figure(figsize=(8,6))
 pc_idx = np.arange(1, len(explained_variance_ratio) + 1)
 plt.plot(pc_idx, explained_variance_ratio, marker='o')
-# Knee detection: max distance to line between first and last points
-if len(explained_variance_ratio) >= 3:
-    x1, y1 = pc_idx[0], explained_variance_ratio[0]
-    x2, y2 = pc_idx[-1], explained_variance_ratio[-1]
-    denom = np.hypot(y2 - y1, x2 - x1)
-    if denom > 0:
-        distances = np.abs((y2 - y1) * pc_idx - (x2 - x1) * explained_variance_ratio + x2 * y1 - y2 * x1) / denom
-        knee_idx = int(np.argmax(distances))
-        knee_pc = pc_idx[knee_idx]
-        plt.axvline(knee_pc, color='red', linestyle='--', label=f'Knee = PC{knee_pc}')
-        plt.legend()
+knee_pc = pc_idx[knee_idx]
+plt.axvline(knee_pc, color='red', linestyle='--', label=f'Knee = PC{knee_pc}')
+plt.legend()
 
 plt.xlabel('Principal Component')
 plt.ylabel('Explained Variance Ratio')
 plt.title('Scree Plot')
 plt.tight_layout()
-plt.savefig(f'{outdir}/cell_abundance_pca_scree_plot.png')
+plt.savefig(f'{abundance_dir}/cell_abundance_pca_scree_plot.png')
 plt.close()
 
 
@@ -781,7 +401,7 @@ for predictor in sig_predictors:
     plt.title(f'PCA (PC1 vs PC2) colored by {predictor}')
     plt.tight_layout()
     safe_pred = str(predictor).replace('/', '.').replace(' ', '_')
-    plt.savefig(f'{outdir}/pca_pc1_pc2_colored_by_{safe_pred}.png')
+    plt.savefig(f'{abundance_dir}/pca_pc1_pc2_colored_by_{safe_pred}.png')
     plt.close()
 
 # Heatmap of PC vs predictor associations (R2 with p<0.05 stars)
@@ -807,51 +427,55 @@ for predictor in meta_cols:
                 heat_r2.loc[predictor, pc] = np.nan
                 heat_p.loc[predictor, pc] = np.nan
                 continue
-            # one-way ANOVA
             try:
-                f_stat, p_val = stats.f_oneway(*groups)
+                _, p_val = stats.kruskal(*groups)
             except Exception:
                 p_val = np.nan
-            heat_r2.loc[predictor, pc] = _r2_for_predictor(yv, xv, categorical=True)
+            heat_r2.loc[predictor, pc] = _r2_for_predictor(yv, xv, categorical=True, use_omega2=use_omega2)
             heat_p.loc[predictor, pc] = p_val
         else:
-            if np.std(xv) == 0:
+            xv_f = xv.astype(float)
+            if np.std(xv_f) == 0:
                 heat_r2.loc[predictor, pc] = np.nan
                 heat_p.loc[predictor, pc] = np.nan
                 continue
-            r, p_val = stats.pearsonr(yv, xv.astype(float))
-            heat_r2.loc[predictor, pc] = r ** 2
+            # linear regression: PC ~ variable
+            xv_design = sm.add_constant(xv_f)
+            try:
+                ols_res = sm.OLS(yv, xv_design).fit()
+                p_val = ols_res.pvalues[1]
+                r2 = ols_res.rsquared
+                if use_omega2:
+                    r2 = 1.0 - (1.0 - r2) * (len(yv) - 1) / (len(yv) - 2)
+            except Exception:
+                p_val, r2 = np.nan, np.nan
+            heat_r2.loc[predictor, pc] = r2
             heat_p.loc[predictor, pc] = p_val
 
-heat_r2_t = heat_r2.T
-heat_p_t = heat_p.T
-# Initialize annot as empty string DataFrame
-annot = pd.DataFrame('', index=heat_r2_t.index, columns=heat_r2_t.columns)
-for pc in heat_r2_t.index:
-    for predictor in heat_r2_t.columns:
-        p_val = heat_p_t.loc[pc, predictor]
-        if pd.notna(p_val) and p_val < 0.05:
-            annot.loc[pc, predictor] = '*'
+# Melt to long format for plotnine
+heat_r2.index.name = 'predictor'
+heat_p.index.name = 'predictor'
+_hm_pc = heat_r2.reset_index().melt(id_vars='predictor', var_name='PC', value_name='r2')
+_hmp_pc = heat_p.reset_index().melt(id_vars='predictor', var_name='PC', value_name='p_val')
+_hm_pc = _hm_pc.merge(_hmp_pc, on=['predictor', 'PC'])
+_hm_pc['sig'] = _hm_pc['p_val'].apply(_sig_stars)
+_hm_pc['predictor_clean'] = _hm_pc['predictor'].str.replace('meta-', '', regex=False)
+_hm_pc['PC'] = pd.Categorical(_hm_pc['PC'], categories=pcs_use, ordered=True)
 
-# Keep both as DataFrames for proper alignment in seaborn
-heat_r2_plot = heat_r2_t.fillna(0)
-
-plt.figure(figsize=(0.8 * len(meta_cols), 0.25 * len(pcs_use) + 4))
-sns.heatmap(
-    heat_r2_plot,
-    annot=annot,
-    fmt='',
-    cmap='viridis',
-    cbar_kws={'label': 'R2'},
-    annot_kws={'color': 'white', 'fontsize': 9, 'fontweight': 'bold'}
+_p_pc = (
+    ggplot(_hm_pc, aes(x='predictor_clean', y='PC', fill=effect_size_col))
+    + geom_tile(color='white', size=0.3)
+    + geom_text(aes(label='sig'), size=7, color='black', va='center')
+    + scale_fill_gradient(low='white', high='#2166ac', name=effect_size_label, na_value='lightgrey')
+    + theme_bw()
+    + theme(
+        axis_text_x=element_text(rotation=45, hjust=1),
+        panel_grid=element_blank(),
+        figure_size=(max(6, 0.6 * len(meta_cols)), max(4, 0.4 * len(pcs_use))),
+    )
+    + labs(x='Predictor', y='PC', title=f'PC vs Predictor Associations ({effect_size_label}, * p<0.05)')
 )
-plt.xlabel('Predictor')
-plt.ylabel('Principal Component')
-plt.title('PC vs Predictor Associations (R2, * p<0.05)')
-plt.xticks(rotation=45, ha='right')
-plt.tight_layout()
-plt.savefig(f'{outdir}/pc_predictor_r2_heatmap.png')
-plt.close()
+_p_pc.save(f'{abundance_dir}/pc_predictor_r2_heatmap.png', dpi=150, bbox_inches='tight')
 
 # Plot a regression for the strongest association
 pc_plot = "PC2"
@@ -889,7 +513,7 @@ plt.title(f'{pc_plot} vs {predictor_plot.replace("_", " ")}')
 plt.legend()
 plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
-plt.savefig(f'{outdir}/{pc_plot}_vs_{predictor_plot}_violin.png')
+plt.savefig(f'{abundance_dir}/{pc_plot}_vs_{predictor_plot}_violin.png')
 plt.close()
 
 ###############
@@ -976,7 +600,7 @@ lm_results_df = pd.DataFrame(lm_results)
 lm_results_df["p_target_adj"] = lm_results_df.groupby("target")["p_target"].transform(lambda p: sm.stats.multipletests(p, method="fdr_bh")[1])
 
 lm_results_df.to_csv(
-    f'{outdir}/celltype_clr_linear_model_results.csv',
+    f'{abundance_dir}/celltype_clr_linear_model_results.csv',
     index=False
 )
 
@@ -1016,18 +640,14 @@ for _, row in sig_results.iterrows():
     plt.title(f'CLR of {celltypelabel} vs {target_var.replace("_", " ")}\n p={row["p_target"]:.3e}, slope={row["coef_target"]:.3f}')
     plt.ylabel('CLR Proportion')
     celltypelabel = str(celltypelabel).replace('/', '.')
-    plt.savefig(f'{outdir}/{label}_{celltypelabel}_clr_vs_{target_var}.png')
+    plt.savefig(f'{pairwise_dir}/{label_lm}_{celltypelabel}_clr_vs_{target_var}.png')
     plt.close() 
     
     
     
 ##################
 # Calculate the amount of variance in gene expression that is explained by the technical factors
-# + compare this with the amount of variance explained by these factors on cell abundances (CLR)
 ##################
-# Load the variance explained by technical factors for cell abundance
-ca_pca_results = pd.read_csv(f'{outdir}/cell_abundance_pca_variance_explained_by_technical_factors.csv')
-
 # Specify pseudobulking options
 pseudobulk_options = {
     'groupby': 'pool_participant',
@@ -1040,7 +660,7 @@ pseudobulk_options = {
     'nhvgs': 0.2
 }
 
-pbfile = f'{outdir}/pseudobulk_expr_matrices-{pseudobulk_options["label"]}-method_{pseudobulk_options["method"]}.pkl'
+pbfile = f'{expression_dir}/pseudobulk_expr_matrices-{pseudobulk_options["label"]}-method_{pseudobulk_options["method"]}.pkl'
 if os.path.exists(pbfile):
     print(f"Loading existing pseudobulk matrices from {pbfile}")
     with open(pbfile, 'rb') as f:
@@ -1056,7 +676,7 @@ else:
     for cell_type, matrix in pseudobulk_matrices.items():
         print(f"{cell_type}: {matrix.shape} (samples x genes)")
     # Save this as a pickle for later use (since it can be time-consuming to generate)
-    with open(f'{outdir}/pseudobulk_expr_matrices-{pseudobulk_options["label"]}-method_{pseudobulk_options["method"]}.pkl', 'wb') as f:
+    with open(pbfile, 'wb') as f:
         pickle.dump(pseudobulk_matrices, f)
 
 
@@ -1065,87 +685,32 @@ n_perm = 1000
 expr_pca_results_list = []
 expr_pc_scores_dict = {}
 group_col= 'pool_participant'
-meta_cols = [
-    'collection_to_wetlab',
-    'shipment_to_wetlab',
-    'num_samples_in_pool',
-    'meta-Sex',
-    'meta-BMI',
-    'meta-Months_since_Dx',
-    'meta-Months_since_Symptoms',
-    'meta-Restricted_diet',
-    'meta-Smoking',
-    'meta-Baseline_Previous_immunomodulator',
-    'meta-Baseline_Number_previous_immunomodulator',
-    'meta-Previous_biologic',
-    'meta-Biologic_starting',
-    'meta-Steroids',
-    'meta-Diagnosis'
-]
 meta_df = obs[[group_col] + meta_cols].drop_duplicates()
 
-for cell_type, expr_matrix in pseudobulk_matrices.items():
-    print(f"..PCA for {cell_type}")
-    
-    # Perform PCA
-    pc_scores, evr = pca_on_expression(expr_matrix, scale=True)
-    pc_scores = pc_scores.rename(columns = {"index": group_col})
-    expr_pc_scores_dict[cell_type] = (pc_scores, evr)
-    
-    # Merge with metadata
-    pc_meta = pc_scores.merge(meta_df, on=group_col, how='left')
-    
-    # Get list of PC columns for this cell type
-    pc_cols_expr = [col for col in pc_scores.columns if col.startswith('PC') and col[2:].isdigit()]
-    
-    # Calculate variance explained by each technical factor
-    print("..Testing variance explained")
-    for predictor in meta_cols:
-        print("....predictor: ", predictor)
-        obs_stat, p_val = permutation_pvalue(pc_meta, predictor, evr, n_perm=n_perm, seed=1, pc_cols=pc_cols_expr)
-        expr_pca_results_list.append({
-            'celltype': cell_type,
-            'predictor': predictor,
-            'weighted_r2': obs_stat,
-            'p_value_perm': p_val,
-            'n_perm': n_perm
-        })
-
-# Combine all results into a single DataFrame
-expr_pca_results = pd.DataFrame(expr_pca_results_list)
-
-# Apply Bonferroni correction within each celltype
-if expr_pca_results.shape[0] > 0:
-    expr_pca_results['p_value_perm_bonf'] = expr_pca_results.groupby('celltype')['p_value_perm'].transform(
-        lambda p: np.minimum(p * len(p), 1.0)
-    )
-
-# Save results
-expr_pca_results.to_csv(f'{outdir}/expression_pca_variance_explained_by_technical_factors.csv', index=False)
-
-# Load results
-expr_pca_results = pd.read_csv(f'{outdir}/expression_pca_variance_explained_by_technical_factors.csv')
+expr_res_file = f'{expression_dir}/expression_pca_variance_explained_by_technical_factors.csv'
+if os.path.exists(expr_res_file):
+    print(f"Loading existing expression PCA variance explained results from {expr_res_file}")
+    expr_pca_results = pd.read_csv(expr_res_file)
+else:
+    expr_pca_results_list = []
+    for cell_type, expr_matrix in pseudobulk_matrices.items():
+        print(f"..PCA for {cell_type}")
+        ct_results, pc_scores, evr, _ = pca_variance_explained(
+            expr_matrix, meta_df, meta_cols, group_col,
+            use_knee=True, scale=True, n_perm=n_perm, seed=1,
+        )
+        ct_results.insert(0, 'celltype', cell_type)
+        expr_pc_scores_dict[cell_type] = (pc_scores, evr)
+        expr_pca_results_list.append(ct_results)
+    expr_pca_results = pd.concat(expr_pca_results_list, ignore_index=True)
+    expr_pca_results.to_csv(expr_res_file, index=False)
 
 # Attach annotations
 expr_pca_results = expr_pca_results.merge(annot_mapping[['label_new', 'category']].drop_duplicates(), left_on="celltype", right_on="label_new", how='left')
 
 # Plot a big heatmap of this
-from plotnine import (
-    ggplot, aes, geom_tile, geom_text, scale_fill_gradient,
-    theme, theme_bw, element_text, element_blank, labs, facet_grid
-)
-
-def _sig_stars(p):
-    if p < 0.001:
-        return "***"
-    elif p < 0.01:
-        return "**"
-    elif p < 0.05:
-        return "*"
-    return ""
-
 _hm = expr_pca_results.copy()
-_hm['sig'] = _hm['p_value_perm_bonf'].apply(_sig_stars)
+_hm['sig'] = _hm['p_value_perm'].apply(_sig_stars)
 _hm['predictor_clean'] = _hm['predictor'].str.replace('meta-', '', regex=False)
 
 # Order cell types grouped by category
@@ -1160,11 +725,19 @@ _n_pred = _hm['predictor_clean'].nunique()
 _fig_w = max(6, _n_pred * 0.6)
 _fig_h = max(4, _n_ct * 0.35)
 
+# Map each cell type to its category color (same color_map as volcano)
+_ct_cat_map = _hm[['celltype', 'category']].drop_duplicates().set_index('celltype')['category'].to_dict()
+_ytick_colors = [color_map.get(_ct_cat_map.get(ct), '#9e9e9e') for ct in _ct_order]
+
+# Replace negative values in the weighted_omega2 column with 0 for better visualization (if using omega2)
+if use_omega2:
+    _hm['weighted_omega2'] = _hm['weighted_omega2'].apply(lambda x: max(x, 0) if pd.notna(x) else x)
+
 _p = (
-    ggplot(_hm, aes(x='predictor_clean', y='celltype', fill='weighted_r2'))
+    ggplot(_hm, aes(x='predictor_clean', y='celltype', fill='weighted_omega2' if use_omega2 else 'weighted_r2'))
     + geom_tile(color='white', size=0.3)
     + geom_text(aes(label='sig'), size=7, color='black', va='center')
-    + scale_fill_gradient(low='white', high='#d62728', name='Weighted R²')
+    + scale_fill_gradient(low='white', high='#d62728', name=effect_size_label)
     + theme_bw()
     + theme(
         axis_text_x=element_text(rotation=45, hjust=1, size=8),
@@ -1172,40 +745,71 @@ _p = (
         panel_grid=element_blank(),
         figure_size=(_fig_w, _fig_h),
     )
-    + labs(x='Predictor', y='Cell type', title='Expression PCA: variance explained by technical factors')
+    + labs(x='Predictor', y='Cell type', title=f'Expression PCA: {effect_size_label} by technical factors',
+           subtitle='* p<0.05, ** p<0.01, *** p<0.001 (permutation p-value, uncorrected)')
 )
-_p.save(f'{outdir}/expr_pca_weighted_r2_heatmap.png', dpi=150, bbox_inches='tight')
+_mpl_fig = _p.draw()
+_ax = _mpl_fig.axes[0]
+for tick, color in zip(_ax.get_yticklabels(), _ytick_colors):
+    tick.set_color(color)
+
+_mpl_fig.savefig(f'{expression_dir}/expr_pca_weighted_r2_heatmap.png', dpi=150, bbox_inches='tight')
+plt.close(_mpl_fig)
 
 
-# Plot the variance explained by the factors that explain variance in cell abundance, but in expression
-factors_of_interest = ca_pca_results.loc[ca_pca_results['p_value_perm'] < 0.05, 'predictor'].tolist()
-if len(factors_of_interest) > 0:
-    expr_pca_results_filtered = expr_pca_results[expr_pca_results['predictor'].isin(factors_of_interest)]
-    for predictor in factors_of_interest:
-        sub = expr_pca_results_filtered[expr_pca_results_filtered['predictor'] == predictor].copy() 
-        ca_r = ca_pca_results.loc[ca_pca_results['predictor'] == predictor, 'weighted_r2'].values[0]
-        plt.figure(figsize=(10, 6))
-        # Create color palette for categories
-        categories = sub['category'].dropna().unique()
-        palette = [color_map.get(cat, '#9e9e9e') for cat in categories]
-        sns.violinplot(data=sub, x='category', y='weighted_r2', inner='box', palette=palette)
-        # Color points by significance
-        sub['point_color'] = np.where(sub['p_value_perm'] < 0.05, 'black', 'grey')
-        sns.stripplot(data=sub, x='category', y='weighted_r2', hue='point_color', palette={'black': 'black', 'grey': 'grey'}, size=4, alpha=0.6, dodge=False, legend=False)
-        plt.axhline(y=ca_r, color='black', linestyle='-', linewidth=2, label=f'Cell Abundance R² = {ca_r:.4f}')
-        # Add legend for point colors
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Line2D([0], [0], linestyle='-', linewidth=2, color='black', label=f'Cell Abundance R² = {ca_r:.4f}'),
-            Line2D([0], [0], marker='o', color='w', label='p < 0.05', markerfacecolor='black', markersize=6),
-            Line2D([0], [0], marker='o', color='w', label='p ≥ 0.05', markerfacecolor='grey', markersize=6)
-        ]
-        plt.legend(handles=legend_elements)
-        plt.xlabel('Category')
-        plt.ylabel('Weighted R²')
-        plt.title(f'Variance Explained (Weighted R²) by {predictor}')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        safe_pred = str(predictor).replace('/', '.').replace(' ', '_')
-        plt.savefig(f'{outdir}/expr_pca_weighted_r2_violin_{safe_pred}.png')
-        plt.close()
+####################
+# Variance in key technical covariates explained by other covariates
+# meta_df is at pool_participant level (one row per sample), defined in the abundance section above
+####################
+query_cols = ['collection_to_wetlab', 'convoluted_samplename']
+cov_pred_cols = [c for c in meta_cols if c not in query_cols]
+
+cov_results = {}
+for query in query_cols:
+    print(f"Testing variance explained in: {query}")
+    cov_pred_cols = [c for c in meta_cols if c != query]
+    res = variance_explained_by_covariates(
+        meta_df, query, cov_pred_cols,
+        use_omega2=use_omega2, n_perm=1000, seed=1,
+    )
+    res['query'] = query
+    cov_results[query] = res
+    res.to_csv(f'{outdir}/covariate_variance_explained_by_{query}.csv', index=False)
+
+# Combined heatmap: predictors on y, query on x, fill = effect size
+_cov_hm = pd.concat(cov_results.values(), ignore_index=True)
+_cov_hm['sig'] = _cov_hm['p_value_perm'].apply(_sig_stars)
+_cov_hm['predictor_clean'] = _cov_hm['predictor'].str.replace('meta-', '', regex=False)
+
+# Order predictors by mean effect size across queries (descending)
+_pred_order = (
+    _cov_hm.groupby('predictor_clean')['effect_size']
+    .mean().sort_values(ascending=False).index.tolist()
+)
+_cov_hm['predictor_clean'] = pd.Categorical(_cov_hm['predictor_clean'], categories=_pred_order, ordered=True)
+
+# Clip negatives to 0 for display
+if use_omega2:
+    _cov_hm['effect_size'] = _cov_hm['effect_size'].clip(lower=0)
+
+_n_pred_cov = len(_pred_order)
+_p_cov = (
+    ggplot(_cov_hm, aes(x='predictor_clean', y='query', fill='effect_size'))
+    + geom_tile(color='white', size=0.4)
+    + geom_text(aes(label='sig'), size=9, color='black', va='center')
+    + scale_fill_gradient(low='white', high='#2ca25f', name=effect_size_label, limits=[0, None])
+    + theme_bw()
+    + theme(
+        axis_text_x=element_text(rotation=45, hjust=1, size=9),
+        axis_text_y=element_text(size=8),
+        panel_grid=element_blank(),
+        figure_size=(max(6, _n_pred_cov * 0.6), 4),
+    )
+    + labs(
+        x=None, y=None,
+        title=f'Variance in technical covariates explained by other covariates\n({effect_size_label})',
+        subtitle='* p<0.05, ** p<0.01, *** p<0.001 (permutation p-value, uncorrected)',
+    )
+)
+_p_cov.save(f'{outdir}/covariate_variance_explained_heatmap.png', dpi=150, bbox_inches='tight')
+
