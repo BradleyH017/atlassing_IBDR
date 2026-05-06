@@ -96,6 +96,7 @@ annot_mapping['annotation_type'] = annot_mapping['Level'].map({0: 'All Cells', 1
 
 meta_cols = [
     'convoluted_samplename',
+    'pool-ss_grouped',
     'collection_to_wetlab',
     'shipment_to_wetlab',
     'num_samples_in_pool',
@@ -131,6 +132,9 @@ meta_df = obs[['pool_participant'] + meta_cols].drop_duplicates()
 ##################
 obs['num_samples_in_pool'] = obs['num_samples_in_pool'].astype(str)
 pool_numbers = np.sort(np.unique(obs['num_samples_in_pool']))
+grouped_pool_numbers = meta_df[['pool-ss_grouped', 'pool_participant']].groupby('pool-ss_grouped').count()['pool_participant'].reset_index()
+grouped_pool_numbers.columns = ['pool-ss_grouped', 'num_samples_grouped_pools']
+meta_df = meta_df.merge(grouped_pool_numbers, on='pool-ss_grouped', how='left')
 
 if plot_distributions:
     os.makedirs(outdir, exist_ok=True)
@@ -142,6 +146,35 @@ if plot_distributions:
     plt.ylabel('Count')
     plt.savefig(f'{outdir}/num_samples_in_pool_hist.png')
     plt.close()
+    # Grouped pool size histogram — broken x-axis (1–10, then 135–1545)
+_gp_data = meta_df['num_samples_grouped_pools'].dropna()
+fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(10, 6),
+                                            sharey=True,
+                                            gridspec_kw={'width_ratios': [1, 4]})
+fig.subplots_adjust(wspace=0.05)
+sns.histplot(_gp_data, binwidth=1, kde=False, ax=ax_left)
+sns.histplot(_gp_data, binwidth=1, kde=False, ax=ax_right)
+ax_left.set_xlim(1, 10)
+ax_right.set_xlim(135, 145)
+# Hide the inner spines to signal the break
+ax_left.spines['right'].set_visible(False)
+ax_right.spines['left'].set_visible(False)
+ax_right.yaxis.set_visible(False)
+# Add diagonal break markers
+d = 0.015
+kwargs = dict(transform=ax_left.transAxes, color='k', clip_on=False)
+ax_left.plot((1 - d, 1 + d), (-d, +d), **kwargs)
+ax_left.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)
+kwargs.update(transform=ax_right.transAxes)
+ax_right.plot((-d, +d), (-d, +d), **kwargs)
+ax_right.plot((-d, +d), (1 - d, 1 + d), **kwargs)
+ax_left.set_xlabel('')
+ax_right.set_xlabel('')
+fig.text(0.5, 0.02, 'Number of Samples', ha='center')
+ax_left.set_ylabel('Count')
+fig.suptitle('Distribution of Num Samples in Grouped Pools')
+plt.savefig(f'{outdir}/num_samples_in_grouped_pools_hist.png', bbox_inches='tight')
+plt.close()
     # Transit-time histograms
     for c in ['shipment_to_wetlab', 'collection_to_wetlab', 'site']:
         plt.figure(figsize=(8, 6))
